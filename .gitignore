@@ -1,0 +1,49 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# Editors / OS / assistants
+.DS_Store
+*.swp
+.claude/
+
+# Sync-client conflict copies
+*conflicted copy*
+
+# Local logs and notes
+*.log
+vlog_*.txt
+COMMENTS_REVIEW.txt
+.vscode/
+
+# Data and figure outputs
+*.h5ad
+figures/
