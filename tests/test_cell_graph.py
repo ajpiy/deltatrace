@@ -178,8 +178,8 @@ def test_networkx_style_access_raises_and_names_the_fix(toy):
 
 @pytest.mark.parametrize("shape", [(1, -1), (-1, 1)])
 def test_a_2d_demand_fails_the_same_way_on_either_graph(toy, shape):
-    """qrot copies f into place element by element for both kinds of graph, so a demand
-    of the wrong shape raises exactly what it raised on the networkx graph."""
+    """qrot checks f's shape before either graph path, so a demand of the wrong shape
+    raises the same error on both."""
     gr = dt.tl.endpoints(toy, toy, ["source"], ["sink"], cluster_key="clusters", graph="intr",
                          p_end=0.05, verbose=0)
     bad = gr["f"].reshape(shape)

@@ -39,7 +39,7 @@ def endpoints(
     adata_clust,
     source_clusters,
     sink_clusters,
-    p_end: float = 0.10,
+    p_end: float = 0.15,
     sampling_mode: str | dict[str, str] = "centered",
     cluster_key: str = "clusters",
     graph: str | None = None,
@@ -72,7 +72,7 @@ def endpoints(
         Cluster labels acting as sinks. ``None`` runs SOURCE-ONLY mode: every
         non-source LCC cell absorbs instead, and terminals are discovered afterwards
         via :func:`terminality` / ``lineages(terminal_clusters=None)``.
-    p_end : float, default 0.10
+    p_end : float, default 0.15
         Sampling fraction; what it's a fraction of is set by ``p_basis``.
     p_basis : {"cluster", "lcc"}, default "cluster"
         Keyword-only. ``"cluster"``: ``p_end`` of each cluster's own eligible pool
@@ -179,27 +179,17 @@ def endpoints(
 
     if p_basis not in ("lcc", "cluster"):
         raise ValueError(
-            f"Invalid p_basis: {p_basis!r}. Must be 'lcc' (p_end is a "
-            f"fraction of the LCC, split equally across a role's clusters) or 'cluster' "
-            f"(a fraction of each cluster's own eligibility pool)."
+            f"p_basis must be 'lcc' or 'cluster', got {p_basis!r}."
         )
 
     # Checked under either basis, like directed_metric: a bad exponent is a caller error
     # even where it is inert. bool is an int in Python, but True is not an exponent.
-    if isinstance(alloc_power, bool) or not isinstance(
-        alloc_power, (int, float, np.integer, np.floating)
-    ):
+    if (isinstance(alloc_power, bool)
+            or not isinstance(alloc_power, (int, float, np.integer, np.floating))
+            or not 0.0 <= float(alloc_power) <= 1.0):
         raise ValueError(
-            f"alloc_power must be a number in [0.0, 1.0], got "
-            f"{type(alloc_power).__name__} {alloc_power!r}. 0.0 splits a role's total "
-            f"equally over its clusters, 1.0 proportionally to pool size."
-        )
-    if not 0.0 <= float(alloc_power) <= 1.0:
-        raise ValueError(
-            f"alloc_power must be in [0.0, 1.0], got {alloc_power!r}. 0.0 is the equal "
-            f"allocation and 1.0 the proportional one; outside that range there is no "
-            f"sampling-theory reading, since below 0.0 would weight SMALL clusters above "
-            f"equal and above 1.0 large clusters beyond proportional."
+            f"alloc_power must be a number in [0, 1] (0 = equal split, 1 = proportional), "
+            f"got {alloc_power!r}."
         )
     alloc_power = float(alloc_power)
 
@@ -229,22 +219,17 @@ def endpoints(
 
     _log.detail(f"Full graph: {n_nodes} nodes, {G_full.m} directed edges")
 
-    # Largest connected component (LCC). Components run largest first, a size tie going
-    # to the component holding the lowest cell index: the order the old
-    # sorted(nx.connected_components(...), key=len, reverse=True) gave, since networkx
-    # found components by ascending cell index and sorted() is stable. Keyed on each
-    # component's lowest cell explicitly, not on how scipy numbers its labels.
+    # Largest connected component (LCC), as _off_lcc_mask picks it. scipy numbers the
+    # components by their lowest cell, so argmax gives a size tie to the component holding
+    # the lowest cell index, as the old sorted(nx.connected_components(...)) did.
     n_comp, comp_labels = csg.connected_components(_cost_csr, directed=False)
     comp_sizes = np.bincount(comp_labels, minlength=n_comp)
-    comp_first = np.unique(comp_labels, return_index=True)[1]
-    # A list, so a graph with no cells fails on [0] as the old sorted(...)[0] did.
-    comp_order = np.lexsort((comp_first, -comp_sizes)).tolist()
-    lcc_mask = comp_labels == comp_order[0]
-    lcc_set = set(np.flatnonzero(lcc_mask).tolist())
+    lcc_mask = comp_labels == comp_sizes.argmax()
+    n_lcc = int(lcc_mask.sum())
     disconnected_indices = np.flatnonzero(~lcc_mask).tolist()
 
     _log.detail(
-        f"LCC: {len(lcc_set)} nodes, "
+        f"LCC: {n_lcc} nodes, "
         f"{len(disconnected_indices)} disconnected, "
         f"{n_comp} components"
     )
@@ -252,24 +237,25 @@ def endpoints(
     disconnected_info = {
         "indices": disconnected_indices,
         "names": [idx_to_name[i] for i in disconnected_indices],
-        "component_sizes": comp_sizes[comp_order].tolist(),
+        "component_sizes": sorted(comp_sizes.tolist(), reverse=True),
     }
 
     labels = adata_clust.obs[cluster_key].astype(str)
 
-    # Map cell index -> cluster label (used for the directional cost bias)
-    node_to_cluster = {
-        name_to_idx[nm]: str(labels[nm]) for nm in labels.index if nm in name_to_idx
-    }
+    # Labeled cells present in the graph, in obs order: their cell index and label
+    graph_names = pd.Index(list(name_to_idx))
+    graph_idx = np.fromiter(name_to_idx.values(), dtype=np.int64, count=len(name_to_idx))
+    pos = graph_names.get_indexer(labels.index)
+    known = pos >= 0
+    lab_cell = graph_idx[pos[known]]
+    lab_name = labels.to_numpy()[known]
 
     def _get_eligible(clusters):
         out = {}
+        in_lcc = lcc_mask[lab_cell]
         for c in clusters:
-            idxs = [
-                name_to_idx[nm]
-                for nm in labels.index[labels == c]
-                if nm in name_to_idx and name_to_idx[nm] in lcc_set
-            ]
+            # Python ints, as the samplers' rng draws index these lists
+            idxs = lab_cell[in_lcc & (lab_name == c)].tolist()
             out[c] = idxs
             if _log.wants_detail():
                 total = int((labels == c).sum())
@@ -309,10 +295,8 @@ def endpoints(
             if pool == 0:
                 raise ValueError(
                     f"{role} cluster '{c}': none of its {int((labels == c).sum())} cells "
-                    f"are in the largest connected component of the '{graph}' graph "
-                    f"({len(lcc_set)} of {n_nodes} cells), so none can be sampled. Drop "
-                    f"it from the {role.lower()} clusters, or keep more edges (a larger "
-                    f"p_keep in pp.graphs, or graph='expr')."
+                    f"are in the largest connected component of the '{graph}' graph. "
+                    "Drop the cluster, or raise p_keep in pp.graphs."
                 )
             pools[c] = pool
         proportional = {
@@ -337,12 +321,12 @@ def endpoints(
         return {c: min(max(1, quotas[c]), pools[c]) for c in names}
 
     if p_basis == "lcc":
-        N = max(1, int(np.round(p_end * len(lcc_set))))
+        N = max(1, int(np.round(p_end * n_lcc)))
         src_quotas = _split_quota("source", N, source_clusters)
         snk_quotas = (
             {} if sink_clusters is None else _split_quota("sink", N, sink_clusters)
         )
-        _log.detail(f"\nN per group: {N} (p_end={p_end}, LCC={len(lcc_set)})")
+        _log.detail(f"\nN per group: {N} (p_end={p_end}, LCC={n_lcc})")
         # Clamp an undersized cluster to what it has, rather than refuse -- at the cost
         # of the matched-totals guarantee p_basis='lcc' otherwise gives (hence the warning).
         for role, quotas, elig in (("source", src_quotas, elig_source),
@@ -353,13 +337,10 @@ def endpoints(
                     continue
                 quotas[c] = pool
                 warnings.warn(
-                    f"endpoints: p_end={p_end} of the largest connected component asks "
-                    f"{role} cluster {c!r} for {q} cells, but only {pool} of its cells "
-                    f"are in the component; sampling all {pool}. The source and sink "
-                    f"totals no longer match, which is what p_basis='lcc' otherwise "
-                    f"guarantees. Pass p_basis='cluster' to size every cluster from its "
-                    f"own pool, or lower p_end to about {p_end * pool / q:.3g} to keep "
-                    f"the lcc basis exact.",
+                    f"p_end={p_end} asks {role} cluster {c!r} for {q} cells, but only "
+                    f"{pool} are in the largest connected component; sampling all {pool}, "
+                    "so the source and sink totals no longer match. Lower p_end to "
+                    f"{p_end * pool / q:.3g}, or pass p_basis='cluster'.",
                     UserWarning,
                     skip_file_prefixes=(_PKG_DIR,),
                 )
@@ -370,12 +351,11 @@ def endpoints(
             empty = [c for c, q in quotas.items() if q == 0]
             if empty:
                 warnings.warn(
-                    f"endpoints: p_end={p_end} of the largest connected component gives "
-                    f"{N} {role} cell(s) to split over {len(quotas)} {role} clusters, so "
-                    f"{empty} get none: they take no part in the transport"
-                    + (" and their lineages will be empty" if role == "sink" else "")
-                    + f". Pass p_basis='cluster' (at least one cell per cluster) or raise "
-                    f"p_end to at least {len(quotas) / len(lcc_set):.3g}.",
+                    f"p_end={p_end} gives {N} {role} cell(s) for {len(quotas)} {role} "
+                    f"clusters, so {empty} get none"
+                    + (" and will have empty lineages" if role == "sink" else "")
+                    + f". Raise p_end to at least {len(quotas) / n_lcc:.3g}, or pass "
+                    "p_basis='cluster'.",
                     UserWarning,
                     skip_file_prefixes=(_PKG_DIR,),
                 )
@@ -400,10 +380,9 @@ def endpoints(
             pool = elig.get(c, [])
             if len(pool) < q:
                 raise ValueError(
-                    f"{role} cluster '{c}': need {q} cells but only {len(pool)} of its "
+                    f"{role} cluster '{c}' needs {q} cells, but only {len(pool)} of its "
                     f"{int((labels == c).sum())} are in the largest connected component of "
-                    f"the '{graph}' graph. Lower p_end, drop the cluster, or keep more edges "
-                    f"(a larger p_keep in pp.graphs, or graph='expr').")
+                    f"the '{graph}' graph. Lower p_end, or raise p_keep in pp.graphs.")
 
     # Helpers: exact graph medoid + centered sampling, both intra cluster. All geodesics
     # run on _cost_csr, in cost units or (unweighted) hops.
@@ -419,10 +398,14 @@ def endpoints(
             # would move the medoid); sorted so ties in the argmin below break on cell index.
             cells = sorted(rng.sample(eligible, 400))
         idx = np.asarray(cells, dtype=np.int64)
-        # One batched dijkstra call for every source; `unweighted` is the only switch,
-        # so the cost branch is untouched (breadth_first_order needs one call per source).
-        sub = csg.dijkstra(_cost_csr, directed=True, indices=idx,
-                           unweighted=hop_metric)[:, idx]
+        # Batched dijkstra calls, 50 sources each so no (400, n_obs) array is ever held;
+        # `unweighted` is the only switch, so the cost branch is untouched
+        # (breadth_first_order needs one call per source).
+        sub = np.vstack([
+            csg.dijkstra(_cost_csr, directed=True, indices=idx[s:s + 50],
+                         unweighted=hop_metric)[:, idx]
+            for s in range(0, idx.size, 50)
+        ])
         sub[~np.isfinite(sub)] = 1e9  # unreachable pair -> finite sentinel
         # argmin keeps the first minimum, so ties resolve deterministically
         return int(idx[int(np.argmin(sub.sum(axis=1)))])
@@ -586,11 +569,11 @@ def endpoints(
         blocked_set = set(blocked_flows)
         # The same `(tail cluster, head cluster) in blocked_set` test as ever, asked once
         # per distinct label pair rather than once per edge. A cell's code indexes
-        # `labs`; code 0 is None, what node_to_cluster.get() gives an unlabeled cell.
-        labs = [None, *dict.fromkeys(node_to_cluster.values())]
-        code_of = {lab: k for k, lab in enumerate(labs)}
+        # `labs`; code 0 is None, for an unlabeled cell.
+        codes, uniq = pd.factorize(lab_name)
+        labs = [None, *uniq]
         node_code = np.zeros(n_nodes, dtype=np.int64)
-        node_code[list(node_to_cluster)] = [code_of[lab] for lab in node_to_cluster.values()]
+        node_code[lab_cell] = codes + 1
         n_labs = len(labs)
         pair = node_code[G_full.edge_array[:, 0]] * n_labs + node_code[G_full.edge_array[:, 1]]
         pairs, pair_inv = np.unique(pair, return_inverse=True)
@@ -620,19 +603,16 @@ def endpoints(
             }
             raise ValueError(
                 f"{len(overlap)} cell(s) sampled as both a source and a sink, by cluster "
-                f"{per_cluster}: the demand vector cannot balance. A cluster named in both "
-                f"roles draws each role independently, so lower p_end or drop the "
-                f"cluster from one role."
+                f"{per_cluster}. Name each cluster in one role only, or lower p_end."
             )
         # Source + sink: mass is absorbed only at the sampled sink cells.
         f[sink_cells_idx] = 1.0 / len(sink_cells_idx)
         assert abs(f.sum()) < 1e-10, f"Flow imbalance: {f.sum()}"
     else:
-        src_labels = {str(c) for c in source_clusters}
-        rest = np.array(
-            sorted(i for i in lcc_set if node_to_cluster.get(i) not in src_labels),
-            dtype=np.int64,
-        )
+        # Every LCC cell outside the source clusters absorbs, unlabeled ones included
+        is_src = np.zeros(n_nodes, dtype=bool)
+        is_src[lab_cell[np.isin(lab_name, source_clusters)]] = True
+        rest = np.flatnonzero(lcc_mask & ~is_src)
         if rest.size == 0:
             raise ValueError("Source-only endpoints: no non-source cells in the LCC to absorb flow.")
         if sink_weights == "uniform":
@@ -640,7 +620,9 @@ def endpoints(
             # its cell share (see param docs: per-cluster equalizing favors small clusters).
             w = np.ones(rest.size)
         elif sink_weights == "cluster_balanced":
-            lab = np.array([node_to_cluster.get(int(i), "") for i in rest])
+            node_lab = np.full(n_nodes, "", dtype=object)    # "" for an unlabeled cell
+            node_lab[lab_cell] = lab_name
+            lab = node_lab[rest].astype(str)
             _, inv, cnt = np.unique(lab, return_inverse=True, return_counts=True)
             w = 1.0 / cnt[inv].astype(float)
         else:

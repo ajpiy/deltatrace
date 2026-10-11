@@ -3,7 +3,7 @@ same values the stages use when called by hand (``basis`` aside: only ``trajecto
 its embedding itself).
 
 Benchmarked for the intersection graph (scRNA-seq with a paired ST section): alpha 0.3,
-p_keep 0.32, p_end 0.10, p_basis "cluster", centered sampling, tau 100.
+p_keep 0.3, p_end 0.15, p_basis "cluster", centered sampling, tau 100.
 """
 
 import inspect
@@ -23,11 +23,11 @@ def _defaults(fn, names):
 
 def test_graph_defaults_are_the_benchmarked_ones():
     for fn in (dt.pp.integrate, dt.pp.graphs):
-        assert _defaults(fn, ["alpha", "p_keep"]) == {"alpha": 0.3, "p_keep": 0.32}
+        assert _defaults(fn, ["alpha", "p_keep"]) == {"alpha": 0.3, "p_keep": 0.3}
 
 
 def test_endpoint_defaults_are_the_benchmarked_ones():
-    want = {"p_end": 0.10, "p_basis": "cluster", "sampling_mode": "centered",
+    want = {"p_end": 0.15, "p_basis": "cluster", "sampling_mode": "centered",
             "cluster_key": "clusters"}
     assert _defaults(dt.tl.endpoints, want) == want
     assert _defaults(dt.tl.trajectory, want) == want
@@ -90,7 +90,7 @@ def test_a_role_missing_from_a_sampling_dict_is_centered(toy_graph):
 # --------------------------------------------------------------------------------------
 def test_a_zero_sink_quota_warns_and_names_the_way_out(toy_graph):
     a = toy_graph.copy()
-    with pytest.warns(UserWarning, match="lineages will be empty") as rec:
+    with pytest.warns(UserWarning, match="will have empty lineages") as rec:
         gr = dt.tl.endpoints(a, a, ["source"], ["mid", "sink"], cluster_key="clusters",
                              graph="intr", p_end=0.005, seed=42, verbose=0, p_basis="lcc")
     msg = str(rec[0].message)
@@ -101,7 +101,7 @@ def test_a_zero_sink_quota_warns_and_names_the_way_out(toy_graph):
 
 def test_a_zero_quota_warning_points_at_the_caller_through_trajectory(toy_graph):
     a = toy_graph.copy()
-    with pytest.warns(UserWarning, match="lineages will be empty") as rec:
+    with pytest.warns(UserWarning, match="will have empty lineages") as rec:
         dt.tl.trajectory(a, ["source"], ["mid", "sink"], graph="intr", p_end=0.005,
                          p_basis="lcc", verbose=0)
     assert [w.filename for w in rec if "get none" in str(w.message)] == [__file__]
@@ -109,7 +109,7 @@ def test_a_zero_quota_warning_points_at_the_caller_through_trajectory(toy_graph)
 
 def test_a_zero_source_quota_warns_without_lineage_talk(toy_graph):
     a = toy_graph.copy()
-    with pytest.warns(UserWarning, match=r"get none: they take no part in the transport\.") as rec:
+    with pytest.warns(UserWarning, match=r"get none\. Raise p_end") as rec:
         dt.tl.endpoints(a, a, ["source", "mid"], ["sink"], cluster_key="clusters",
                         graph="intr", p_end=0.005, seed=42, verbose=0, p_basis="lcc")
     assert "source cluster" in str(rec[0].message)

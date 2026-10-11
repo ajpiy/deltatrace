@@ -1,6 +1,6 @@
 [project]
 name = "deltatrace"
-version = "0.1.0"
+version = "0.2.0"
 description = "DeltaTrace: spatially regularized trajectory inference for single-cell and spatial transcriptomic data via graph-based optimal transport"
 readme = "README.md"
 authors = [
@@ -24,11 +24,9 @@ requires-python = ">=3.12"
 # Floors are the oldest releases the code is tested against (see CHANGELOG), not the
 # newest ones the dev environment happens to hold, so the package resolves inside an
 # existing scanpy environment. Everything the source imports is listed, including
-# CLARABEL (the one solver qrot() asks cvxpy for) and natsort (imported directly).
+# natsort (imported directly).
 dependencies = [
     "anndata>=0.10",
-    "clarabel>=0.9",
-    "cvxpy>=1.5",
     "joblib>=1.3",
     "matplotlib>=3.8",
     "natsort>=8",

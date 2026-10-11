@@ -2,16 +2,18 @@
 
 Toy flow DAG:  S(0) -> M(1) -> {A(2), B(3)}.  M is a bipotent split, so the chain
 must report M (and the source S it feeds) as genuinely split by the branch masses,
-not 100 % one fate. Fates are computed by one backward pass and are unique.
+not 100 % one fate. Fates are one exact sparse solve and are unique.
 """
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import pytest
+import scipy.sparse as sp
 from _line_toy import line_toy
 
 import deltatrace as dt
+from deltatrace._lineages import absorption
 
 
 def _toy(mA=0.5, mB=0.5):
@@ -141,3 +143,39 @@ def test_fate_leakage_matches_lineage_confidence_on_the_stock_toy():
     assert np.isnan(conf).sum() == 13                      # the known off-path cells
     np.testing.assert_array_equal(np.isnan(leak), np.isnan(conf))
     assert np.nanmean(leak) < 1e-3                         # on-path mean, not 0.0867
+
+
+def _chain(edges, w, q):
+    """Absorbing chain from (u, v) edges with transition weights w and stop probabilities q."""
+    n = len(q)
+    u, v = np.array(edges).T
+    return dict(T=sp.csr_matrix((w, (u, v)), shape=(n, n)), q=np.asarray(q, float), n=n)
+
+
+def test_absorption_is_exact_on_a_cycle():
+    # 0 -> 1 <-> 2: a back-edge 2 -> 1 that a descending-pseudotime pass would drop
+    ch = _chain([(0, 1), (1, 2), (2, 1)], [0.5, 0.5, 0.3], [0.5, 0.5, 0.7])
+    A, b, _ = absorption(ch, {"one": [1], "two": [2]})
+    np.testing.assert_allclose(A[0], [5 / 17, 7 / 34], atol=1e-15)
+    np.testing.assert_allclose(A[1:], [[10 / 17, 7 / 17], [3 / 17, 14 / 17]], atol=1e-15)
+    np.testing.assert_allclose(b, [0.5, 1.0, 1.0], atol=1e-15)
+
+
+def test_absorption_on_a_dag_matches_back_substitution():
+    rng = np.random.default_rng(0)
+    n = 30
+    edges = [(i, j) for i in range(n) for j in range(i + 1, n) if rng.random() < 0.2]
+    w = rng.random(len(edges))
+    out = np.bincount([i for i, _ in edges], weights=w, minlength=n)
+    q = rng.random(n) * (out > 0) + (out == 0)  # sinks stop with probability 1
+    w = w * (1 - q[[i for i, _ in edges]]) / out[[i for i, _ in edges]]
+    ch = _chain(edges, w, q)
+    groups = {"a": np.arange(n - 5, n - 2), "b": np.arange(n - 2, n)}
+    A, _, _ = absorption(ch, groups)
+    ref = np.zeros((n, 2))  # back substitution in reverse topological order
+    for k, g in enumerate(groups.values()):
+        ref[g, k] = q[g]
+    T = ch["T"].toarray()
+    for i in range(n - 1, -1, -1):
+        ref[i] += T[i] @ ref
+    np.testing.assert_allclose(A, ref, rtol=0, atol=1e-14)

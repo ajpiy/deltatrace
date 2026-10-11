@@ -1,9 +1,10 @@
-"""datasets.crypt — the crypt toy keeps its promise at package defaults.
+"""datasets.crypt — the crypt toy keeps its promise at p_keep 0.32, its spatial calibration.
 
 The promise is geometric: at p_keep=0.32 the intersection graph cuts every expression
 link across the lumen but keeps the two walls joined through the base, so ``intr`` is ONE
 connected U, every wall cell reaches its own top, and no flow crosses the lumen, while an
-expression-only graph still sends about a third of the wall cells to the wrong top.
+expression-only graph still sends about a third of the wall cells to the wrong top. The
+package default p_keep 0.3 cuts them too; above about 0.4 the rungs across the lumen come back.
 """
 
 import contextlib
@@ -11,16 +12,26 @@ import io
 
 import numpy as np
 import pytest
+import scipy.sparse as sp
 from scipy.sparse.csgraph import connected_components
 
 import deltatrace as dt
 
 SOURCES, SINKS = ["progenitor"], ["fate_A", "fate_B"]
+P_KEEP = 0.32  # the crypt's spatial calibration; the rungs come back just above 0.4
 
 
 def _intr_components(g):
     C = g.obsp[g.uns["neighbors_intr"]["connectivities_key"]]
     return connected_components(C, directed=False)
+
+
+def _rungs(g, adata):
+    """Number of intr edges joining cells on opposite walls, neither on the base."""
+    wall = adata.obs["wall"].astype(str).to_numpy()
+    C = sp.triu(g.obsp[g.uns["neighbors_intr"]["connectivities_key"]]).tocoo()
+    u, v = C.row, C.col
+    return int(((wall[u] != wall[v]) & (wall[u] != "base") & (wall[v] != "base")).sum())
 
 
 def _fates(g, key, adata):
@@ -80,7 +91,7 @@ def test_cells_are_not_stored_wall_by_wall():
 @pytest.mark.parametrize(("n", "seed"), [(n, s) for n in (80, 150) for s in range(5)] + [(1000, 7)])
 def test_intr_is_one_component_and_the_lumen_is_cut(n, seed):
     adata, adata_dist = dt.datasets.crypt(n=n, seed=seed)
-    g = dt.pp.graphs(adata, adata_dist, verbose=0)
+    g = dt.pp.graphs(adata, adata_dist, p_keep=P_KEEP, verbose=0)
     ncomp, _ = _intr_components(g)
     assert ncomp == 1
     with contextlib.redirect_stdout(io.StringIO()):
@@ -100,13 +111,20 @@ def test_expression_alone_cannot_tell_the_walls_apart():
     assert cross > 0.2
 
 
+def test_the_rungs_come_back_above_p_keep_0_4():
+    adata, adata_dist = dt.datasets.crypt(n=150)
+    assert _rungs(dt.pp.graphs(adata, adata_dist, p_keep=P_KEEP, verbose=0), adata) == 0
+    assert _rungs(dt.pp.graphs(adata, adata_dist, verbose=0), adata) == 0      # the default 0.3 cuts them too
+    assert _rungs(dt.pp.graphs(adata, adata_dist, p_keep=0.45, verbose=0), adata) > 0
+
+
 def test_false_fate_is_cut_off_as_its_own_component():
     adata, adata_dist = dt.datasets.crypt(n=150, false_fate=0.03)
     false = (adata.obs["clusters"] == "false_fate").to_numpy()
     assert false.sum() >= 3
     assert adata.uns["story"]["decoy_clusters"] == ["false_fate"]
     assert np.isnan(adata.obs["true_time"].to_numpy()[false]).all()
-    g = dt.pp.graphs(adata, adata_dist, verbose=0)
+    g = dt.pp.graphs(adata, adata_dist, p_keep=P_KEEP, verbose=0)
     _, comp = _intr_components(g)
     main = np.argmax(np.bincount(comp))
     np.testing.assert_array_equal(comp != main, false)

@@ -92,10 +92,8 @@ def test_off_lcc_cells_get_the_lcc_median_when_reconnect_is_off(split_basis):
     # the cells the median was written to are exactly the off-LCC ones
     assert list(np.where(_off_lcc_mask(split_basis, "intr"))[0]) == ISLAND
     assert graph["disconnected_info"]["indices"] == ISLAND
-    # not the arbitrary dual any more: pseudotime_raw still holds that, and it differs
-    raw_island = split_basis.obs["pseudotime_raw"].to_numpy()[ISLAND]
-    assert np.isfinite(raw_island).all()
-    assert raw_island[0] != pytest.approx(expected)
+    # before the placeholder they had no potential: no source or sink in their piece
+    assert np.isnan(split_basis.obs["pseudotime_raw"].to_numpy()[ISLAND]).all()
 
 
 def test_reconnect_true_still_takes_an_lcc_cells_value_not_the_median(split_basis, clust):

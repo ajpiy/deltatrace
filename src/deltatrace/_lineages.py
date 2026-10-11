@@ -9,6 +9,7 @@ import warnings
 
 import numpy as np
 import scipy.sparse as sp
+from scipy.sparse.linalg import spsolve
 
 from . import _log
 from ._utils import _suffix
@@ -26,26 +27,16 @@ def _check_terminal_cut(terminal_clusters, omega_term, n_lineages) -> None:
         return
     if omega_term is not None:
         raise ValueError(
-            f"omega_term={omega_term} and n_lineages={n_lineages} are mutually exclusive "
-            "ways of cutting the same terminality ranking: omega_term cuts it by VALUE "
-            "(Term_i >= omega_term), n_lineages by COUNT (the top n rows). Pass one."
+            f"Pass omega_term or n_lineages, not both (got {omega_term} and {n_lineages})."
         )
     if terminal_clusters is not None:
         raise ValueError(
-            f"n_lineages={n_lineages} only chooses terminals in source-only mode, but "
-            f"terminal_clusters={[str(c) for c in terminal_clusters]} already fixes them. "
-            "Drop n_lineages, or pass terminal_clusters=None to discover the terminals."
+            "n_lineages only applies in source-only mode, but terminal_clusters="
+            f"{[str(c) for c in terminal_clusters]} already names the terminals."
         )
-    if isinstance(n_lineages, bool) or not isinstance(n_lineages, (int, np.integer)):
-        raise ValueError(
-            f"n_lineages must be an integer >= 1, got {n_lineages!r} "
-            f"({type(n_lineages).__name__}); it counts lineages."
-        )
-    if n_lineages < 1:
-        raise ValueError(
-            f"n_lineages must be an integer >= 1, got {n_lineages}; a trajectory needs at "
-            "least one terminal."
-        )
+    if (isinstance(n_lineages, bool) or not isinstance(n_lineages, (int, np.integer))
+            or n_lineages < 1):
+        raise ValueError(f"n_lineages must be an integer >= 1, got {n_lineages!r}.")
 
 
 @_log.stage("assigning lineages by absorbing chain")
@@ -59,7 +50,7 @@ def lineages(
     pt_key: str | None = None,
     omega_term: float | None = None,
     n_lineages: int | None = None,
-    edge_threshold: float = 1e-6,
+    edge_threshold: float = 0,
     verbose: int | bool = 1,
     key_added: str | None = None,
 ) -> dict:
@@ -88,7 +79,7 @@ def lineages(
         clusters by terminality (see :func:`terminality`) and cuts that ranking by
         ``omega_term`` or ``n_lineages`` (exactly one required).
     omega_term : float, optional
-        Terminal cutoff on cluster terminality ``Term_i = 1 - out/in``; used only
+        Terminal cutoff on cluster terminality, ``term_score = 1 - flow_out/flow_in``; used only
         when ``terminal_clusters is None``. :func:`terminality` suggests a value
         from the largest gap in the sorted table.
     n_lineages : int, optional
@@ -98,8 +89,8 @@ def lineages(
         ``obs`` column holding the cluster labels.
     flow_key, pt_key : str
         ``uns`` / ``obs`` keys for the flow and pseudotime.
-    edge_threshold : float, default 1e-6
-        Active-edge floor defining the flow DAG.
+    edge_threshold : float, default 0
+        Minimum flow for an edge to count; 0 keeps exactly the edges the optimal flow uses.
     verbose : int or bool, default 1
         Logging verbosity.
     key_added : str, optional
@@ -131,54 +122,46 @@ def lineages(
             adata, None, cluster_key, flow_key=flow_key, edge_threshold=edge_threshold,
             source_clusters=src,
         )
-        if omega_term is None and n_lineages is None:
-            omega, info = suggest_omega(term["Term"].to_numpy())
-            note = ("a CLEAR gap" if info["clear"]
-                    else "NO clear gap: omega_term is a fudge factor you must declare")
-            # Count what the cutoff keeps
-            n_sug = int((term["Term"] >= omega).sum())
-            count_route = (
-                " Or cut the same ranking by count with n_lineages: that cut is "
-                f"n_lineages={n_sug}." if n_sug else ""
-            )
+        if len(term) == 0:
             raise ValueError(
-                "Source-only lineages need an explicit omega_term (terminal cutoff on the "
-                "cluster terminality Term_i = 1 - out/in). Inspect the table with "
-                "deltatrace.tl.terminality(); the largest gap suggests "
-                f"omega_term={omega:.3f} ({note})." + count_route
+                "No cluster receives flow from another cluster, so there are no terminals "
+                "to rank: check source_clusters and cluster_key."
+            )
+        if omega_term is None and n_lineages is None:
+            omega, _ = suggest_omega(term["term_score"].to_numpy())
+            picked = [str(c) for c in term.index[term["term_score"] >= omega]]
+            raise ValueError(
+                "Source-only lineages need n_lineages or omega_term; the terminality "
+                f"ranking suggests {picked} (n_lineages={len(picked)}, "
+                f"omega_term={omega:.3f})."
             )
         if n_lineages is not None:
             if n_lineages > len(term):
                 raise ValueError(
-                    f"n_lineages={n_lineages} exceeds the {len(term)} rankable cluster(s) "
-                    f"{[str(c) for c in term.index]}: terminality ranks only clusters that "
-                    "cross-cluster flow reaches (in > 0) and drops the source clusters, so "
-                    "there are fewer of them than there are clusters. Lower n_lineages."
+                    f"n_lineages={n_lineages} exceeds the {len(term)} cluster(s) in the "
+                    f"terminality ranking, {[str(c) for c in term.index]}."
                 )
             terminal_clusters, tied = top_terminals(term, n_lineages)
             if tied:
                 warnings.warn(
-                    f"n_lineages={n_lineages} cuts through a tie in the terminality "
-                    f"ranking: clusters {tied} all score Term="
-                    f"{float(term.loc[tied[0], 'Term']):.6g}, so which of them was taken "
-                    "as terminal is arbitrary, not a property of the flow. Inspect the "
-                    "table with deltatrace.tl.terminality() and cut with omega_term, or "
-                    "pick an n_lineages that keeps or drops the tied clusters together.",
+                    f"n_lineages={n_lineages} splits clusters {tied}, tied at term_score="
+                    f"{float(term.loc[tied[0], 'term_score']):.6g}: pick an n_lineages "
+                    "that keeps or drops them together.",
                     UserWarning,
                     stacklevel=3,
                 )
             _log.detail(
-                f"discovered terminals (top {n_lineages} by Term): {terminal_clusters}"
+                f"discovered terminals (top {n_lineages} by terminality): {terminal_clusters}"
             )
         else:
-            terminal_clusters = [str(c) for c in term.index[term["Term"] >= omega_term]]
+            terminal_clusters = [str(c) for c in term.index[term["term_score"] >= omega_term]]
             if not terminal_clusters:
                 raise ValueError(
-                    f"No cluster has Term_i >= omega_term={omega_term} "
-                    f"(max Term_i = {term['Term'].max():.3f}). Lower omega_term."
+                    f"No cluster has term_score >= omega_term={omega_term} "
+                    f"(max term_score = {term['term_score'].max():.3f}). Lower omega_term."
                 )
             _log.detail(
-                f"discovered terminals (Term>={omega_term}): {terminal_clusters}"
+                f"discovered terminals (term_score >= {omega_term}): {terminal_clusters}"
             )
     return lineages_from_chain(
         adata, source_idx, terminal_clusters, cluster_key=cluster_key,
@@ -193,18 +176,18 @@ def terminality(
     cluster_key: str = "clusters",
     source_clusters=None,
     flow_key: str | None = None,
-    edge_threshold: float = 1e-6,
+    edge_threshold: float = 0,
     key_added: str | None = None,
     show: bool = True,
 ):
     """Rank clusters by how terminal the flow makes them look.
 
-    Scores each cluster by cross-cluster flux, ``Term_i = 1 - out_i / in_i``: a
+    Scores each cluster by cross-cluster flux, terminality, ``term_score = 1 - flow_out / flow_in``: a
     cluster that takes flow in and passes none on scores near 1, a progenitor
-    scores strongly negative. Prints the sorted table and a suggested
-    ``omega_term`` at the largest gap; pass the chosen value to
-    ``lineages(terminal_clusters=None, omega_term=...)``, or cut the same ranking
-    by count with ``n_lineages=...``.
+    scores strongly negative. Prints the sorted table and suggests the clusters above
+    its largest gap as terminals; pass their number to
+    ``lineages(terminal_clusters=None, n_lineages=...)``, or cut the same ranking by
+    value with ``omega_term=...``.
 
     Parameters
     ----------
@@ -218,8 +201,8 @@ def terminality(
         suggestion). Pass the same value you give :func:`lineages`.
     flow_key : str, optional
         ``uns`` key holding the solved flow. Overrides ``key_added`` when given.
-    edge_threshold : float, default 1e-6
-        Active-edge floor, matching :func:`lineages`.
+    edge_threshold : float, default 0
+        Minimum flow for an edge to count; 0 keeps exactly the edges the optimal flow uses.
     key_added : str, optional
         Read ``uns['dt_flow_<key_added>']`` instead of the flat ``uns['dt_flow']``.
     show : bool, default True
@@ -229,7 +212,7 @@ def terminality(
     Returns
     -------
     pandas.DataFrame
-        Sorted by ``Term`` descending; columns ``inf``, ``out``, ``W``, ``Term``.
+        Sorted by ``term_score`` descending; columns ``flow_in``, ``flow_out``, ``absorbed``, ``term_score`` (terminality).
     """
 
     flow_key = flow_key or f"dt_flow{_suffix(key_added)}"
@@ -238,27 +221,19 @@ def terminality(
         source_clusters=source_clusters,
     )
     if show:
-        omega, info = suggest_omega(g["Term"].to_numpy())
-        print("cluster terminality (Term_i = 1 - out/in, higher = more terminal):")
-        print(g[["inf", "out", "W", "Term"]].round(4).to_string())
-        above = list(g.index[g["Term"] >= omega])
-        if info["clear"]:
-            print(f"\nsuggested omega_term = {omega:.3f}  (CLEAR gap "
-                  f"{info['gap_lo']:.3f}->{info['gap_hi']:.3f}; any omega inside gives "
-                  f"the same terminals)")
-        else:
-            print(f"\nsuggested omega_term = {omega:.3f}  (no clear gap, largest is "
-                  f"{info['gap_lo']:.3f}->{info['gap_hi']:.3f}; omega is a fudge factor: "
-                  f"declare it in Methods)")
-        print(f"terminals at that cut: {above}")
+        omega, info = suggest_omega(g["term_score"].to_numpy())
+        print("cluster terminality (term_score = 1 - flow_out/flow_in, higher = more terminal):")
+        print(g[["flow_in", "flow_out", "absorbed", "term_score"]].round(4).to_string())
+        above = [str(c) for c in g.index[g["term_score"] >= omega]]
         if above:
-            print(f"(or cut by count instead: lineages(n_lineages={len(above)}) takes "
-                  "the same top rows)")
+            gap = "clear gap" if info["clear"] else "no clear gap, largest"
+            print(f"\nsuggested terminals: {above} (n_lineages={len(above)}; {gap} "
+                  f"{info['gap_lo']:.3f} -> {info['gap_hi']:.3f})")
     return g
 
 
 def widest_path(adata, src, dst, *, flow_key: str | None = None,
-                edge_threshold: float = 1e-6, key_added: str | None = None):
+                edge_threshold: float = 0, key_added: str | None = None):
     """Trace the highest-capacity route from one cell to another through the flow.
 
     Returns the ``src`` -> ``dst`` path whose thinnest edge is as thick as possible
@@ -276,8 +251,8 @@ def widest_path(adata, src, dst, *, flow_key: str | None = None,
     flow_key : str, optional
         ``uns`` key of the flow written by :func:`qrot`. Overrides ``key_added``
         when given.
-    edge_threshold : float, default 1e-6
-        Ignore edges carrying less flow than this.
+    edge_threshold : float, default 0
+        Minimum flow for an edge to count; 0 keeps exactly the edges the optimal flow uses.
     key_added : str, optional
         Namespace of the run to trace, matching the one given to :func:`qrot`.
 
@@ -296,7 +271,7 @@ def widest_path(adata, src, dst, *, flow_key: str | None = None,
             f"No flow data in adata.uns['{flow_key}']. Run qrot() with adata_basis set "
             f"(and the same key_added) first."
         )
-    E = np.asarray(fl["edges"], np.int64)
+    E = np.asarray(fl["edges"], np.int64).reshape(-1, 2)   # an edgeless flow stores shape (0,)
     J = np.asarray(fl["J"], float).ravel()
     keep = J > edge_threshold
     # widest_path only needs the cell count; no chain or flow conservation required.
@@ -304,13 +279,13 @@ def widest_path(adata, src, dst, *, flow_key: str | None = None,
 
 
 EPS = 1e-12
+FATE_FLOOR = 1e-10   # fate shares below this are solver rounding (observed <= 7e-14; real >= 3e-4)
 
 
 # ---------------------------------------------------------------------------
 # Chain construction and absorption
 # ---------------------------------------------------------------------------
-def build_chain(adata, source_idx, flow_key="dt_flow", pt_key="pseudotime",
-                edge_threshold=1e-6):
+def build_chain(adata, source_idx, flow_key="dt_flow", edge_threshold=0):
     """Turn the solved QROT flow into an absorbing Markov chain over cells.
 
     Keeps only edges carrying real flow (``J > edge_threshold``), then splits each
@@ -321,30 +296,27 @@ def build_chain(adata, source_idx, flow_key="dt_flow", pt_key="pseudotime",
     Parameters
     ----------
     adata : anndata.AnnData
-        Object holding the flow in ``uns[flow_key]`` and pseudotime in ``obs[pt_key]``.
+        Object holding the flow in ``uns[flow_key]``.
     source_idx : array-like of int
         Positions of the progenitor cells the demand vector emits from; no other
         cell may carry net supply.
     flow_key : str, default "dt_flow"
         ``uns`` key of the QROT flow, ``{J (m,), edges (m, 2)}``.
-    pt_key : str, default "pseudotime"
-        ``obs`` column with the QROT pseudotime, which fixes the backward-pass order.
-    edge_threshold : float, default 1e-6
-        Flow floor for an edge to count as active.
+    edge_threshold : float, default 0
+        Minimum flow for an edge to count; 0 keeps exactly the edges the optimal flow uses.
 
     Returns
     -------
     dict
         ``T`` (n, n) sparse transition matrix, ``q`` (n,) absorption probability,
         ``theta`` (n,) throughput, ``inflow``/``outflow``/``supply``/``absorbed``
-        (n,), ``order`` (n,) cells in descending pseudotime, ``live`` (n,) cells
-        the flow reaches, and ``n``.
+        (n,), ``live`` (n,) cells the flow reaches, and ``n``.
     """
     fl = adata.uns[flow_key]
     J = np.asarray(fl["J"], float).ravel()
     E = np.asarray(fl["edges"], np.int64)
     n = adata.n_obs
-    keep = J > edge_threshold  # active support (edges carrying real flow); this is the DAG
+    keep = J > edge_threshold  # active support (edges carrying real flow)
     u, v, j = E[keep, 0], E[keep, 1], J[keep]
 
     inflow  = np.bincount(v, j, minlength=n)
@@ -358,10 +330,9 @@ def build_chain(adata, source_idx, flow_key="dt_flow", pt_key="pseudotime",
     src_supply = float(net_emit[src_i].sum())
     if resid.sum() > 1e-3 * max(src_supply, EPS):
         raise ValueError(
-            f"flow does not conserve: non-source supply {resid.sum():.2e} is not negligible "
-            f"vs source supply {src_supply:.2e} "
-            f"(ratio {resid.sum() / max(src_supply, EPS):.1e}). "
-            f"Check that source_idx names the cells the demand vector emits from.")
+            f"The flow does not match these sources: non-source cells emit "
+            f"{resid.sum():.2e} against {src_supply:.2e} from the sources. Pass the source "
+            "clusters the flow was solved with.")
     sigma = net_emit  # sources + absorbed residual
     theta = inflow + sigma  # == outflow + delta
     delta = np.maximum(theta - outflow, 0.0)  # absorbed mass
@@ -374,20 +345,19 @@ def build_chain(adata, source_idx, flow_key="dt_flow", pt_key="pseudotime",
     rs = np.asarray(T.sum(1)).ravel() + q  # rows(T) + q, exact by design
     bad = np.abs(rs[live] - 1.0).max() if live.any() else 0.0  # a breach is a coding error
     assert bad < 1e-8, f"rows(T)+q != 1 (max dev {bad:.2e}): chain construction error"
-
-    pt = adata.obs[pt_key].to_numpy(float)
-    order = np.argsort(-np.nan_to_num(pt, nan=-np.inf))  # descending pt = reverse topographical order
     return dict(T=T, q=q, theta=theta, inflow=inflow, outflow=outflow, supply=sigma,
-                absorbed=delta, order=order, live=live, n=n)
+                absorbed=delta, live=live, n=n)
 
 
 def absorption(chain, groups):
     """Compute how each cell's descendants divide between the terminal groups.
 
     A cell reaches lineage l either by stopping where it is (if it is one of that lineage's
-    terminal cells) or by stepping to a downstream cell, so one backward pass solves
+    terminal cells) or by stepping to a downstream cell, so ``A`` solves the linear system
 
-        a[i,l] = q_i * 1{i in l} + sum_u T[i,u] a[u,l]
+        a[i,l] = q_i * 1{i in l} + sum_u T[i,u] a[u,l],   i.e.   (I - T) A = R
+
+    exactly, cycles in the active flow included.
 
     Parameters
     ----------
@@ -409,18 +379,14 @@ def absorption(chain, groups):
         all, how its progeny split between lineages. Rows sum to 1; cells the flow never
         reaches are NaN.
     """
-    n, T, q = chain["n"], chain["T"].tocsr(), chain["q"]
+    n, T, q = chain["n"], chain["T"], chain["q"]
     names = list(groups)
-    A = np.zeros((n, len(names)))
-    for k, name in enumerate(names):  # root term: absorbed mass q, for this lineage's own cells
-        m = np.zeros(n, bool); m[np.asarray(groups[name])] = True
-        A[m, k] = q[m]
-    indptr, indices, data = T.indptr, T.indices, T.data
-    for v in chain["order"]:  # descending pseudotime
-        sl = slice(indptr[v], indptr[v + 1])
-        if sl.start == sl.stop:
-            continue
-        A[v] += data[sl] @ A[indices[sl]]  # accumulate downstream absorption via T[v,u]
+    R = np.zeros((n, len(names)))
+    for k, name in enumerate(names):  # absorbed mass q at this lineage's own terminal cells
+        g = np.asarray(groups[name]); R[g, k] = q[g]
+    A = spsolve(sp.identity(n, format="csc") - T, R).reshape(n, len(names))
+    # shares below FATE_FLOOR of a cell's absorbed mass are rounding from the solve, not fates
+    A[A < FATE_FLOOR * A.sum(1, keepdims=True)] = 0.0
     b = A.sum(1)
     F = np.divide(A, b[:, None], out=np.full_like(A, np.nan), where=b[:, None] > EPS)
     return A, b, F
@@ -430,11 +396,11 @@ def absorption(chain, groups):
 # Terminal discovery  (the source-only mode)
 # ---------------------------------------------------------------------------
 def _rank_order(term):
-    """Sort a terminality table: Term descending, then W descending, then cluster
+    """Sort a terminality table: term_score descending, then absorbed descending, then cluster
     name ascending (a total order, so ties are deterministic)."""
     g = term.copy()
     g["_name"] = [str(i) for i in g.index]
-    g = g.sort_values(["Term", "W", "_name"], ascending=[False, False, True])
+    g = g.sort_values(["term_score", "absorbed", "_name"], ascending=[False, False, True])
     return g.drop(columns="_name")
 
 
@@ -447,17 +413,17 @@ def _cross_cluster_flux(adata, cluster_key, flow_key="dt_flow", edge_threshold=1
     fl = adata.uns[flow_key]
     J = np.asarray(fl["J"], float).ravel(); E = np.asarray(fl["edges"], np.int64)
     k = J > edge_threshold
-    lab = adata.obs[cluster_key].astype(str).to_numpy()
-    cu, cv = lab[E[k, 0]], lab[E[k, 1]]
+    codes, labs = pd.factorize(adata.obs[cluster_key].astype(str).to_numpy())
+    cu, cv = codes[E[k, 0]], codes[E[k, 1]]
     cross = cu != cv
-    return pd.DataFrame(dict(src=cu[cross], dst=cv[cross], j=J[k][cross]))
+    return pd.DataFrame(dict(src=labs[cu[cross]], dst=labs[cv[cross]], j=J[k][cross]))
 
 
-def cluster_terminality(adata, chain, cluster_key, flow_key="dt_flow", edge_threshold=1e-6,
+def cluster_terminality(adata, chain, cluster_key, flow_key="dt_flow", edge_threshold=0,
                         source_clusters=None):
     """Rank clusters by how much of the flow they swallow, i.e. how terminal they look.
 
-        Term_k = W_k / in_k = 1 - out_k / in_k        on CROSS-cluster flux only
+        term_score_k = absorbed_k / flow_in_k = 1 - flow_out_k / flow_in_k        on CROSS-cluster flux only
 
     Print the sorted table and look for a gap before fixing omega_term.
 
@@ -471,8 +437,8 @@ def cluster_terminality(adata, chain, cluster_key, flow_key="dt_flow", edge_thre
         ``obs`` column with the cluster labels.
     flow_key : str, default "dt_flow"
         ``uns`` key of the QROT flow.
-    edge_threshold : float, default 1e-6
-        Flow floor for an edge to count as active.
+    edge_threshold : float, default 0
+        Minimum flow for an edge to count; 0 keeps exactly the edges the optimal flow uses.
     source_clusters : sequence of str, optional
         Progenitor labels to drop from the table before the gap search (they score
         strongly negative and would otherwise hijack :func:`suggest_omega`).
@@ -480,8 +446,8 @@ def cluster_terminality(adata, chain, cluster_key, flow_key="dt_flow", edge_thre
     Returns
     -------
     pandas.DataFrame
-        One row per cluster, sorted by ``Term`` descending; columns ``inf``
-        (cross-cluster inflow), ``out`` (outflow), ``W`` and ``Term``. Clusters no
+        One row per cluster, sorted by ``term_score`` descending; columns ``flow_in``
+        (cross-cluster inflow), ``flow_out`` (outflow), ``absorbed`` and ``term_score`` (terminality). Clusters no
         cross-cluster flux reaches are absent.
     """
     import pandas as pd
@@ -490,14 +456,14 @@ def cluster_terminality(adata, chain, cluster_key, flow_key="dt_flow", edge_thre
                              edge_threshold=edge_threshold)
     out_i = df.groupby("src")["j"].sum()
     in_i = df.groupby("dst")["j"].sum()
-    g = pd.DataFrame(dict(inf=in_i, out=out_i)).fillna(0.0)
-    # Term is only defined where mass arrives (drops the in == 0 rows)
-    g = g[g["inf"] > EPS].copy()
+    g = pd.DataFrame(dict(flow_in=in_i, flow_out=out_i)).fillna(0.0)
+    # term_score is only defined where mass arrives (drops the flow_in == 0 rows)
+    g = g[g["flow_in"] > EPS].copy()
     if source_clusters is not None:
         src = {str(c) for c in source_clusters}
         g = g[~g.index.isin(src)].copy()
-    g["W"] = g["inf"] - g["out"]
-    g["Term"] = 1.0 - g["out"] / g["inf"]
+    g["absorbed"] = g["flow_in"] - g["flow_out"]
+    g["term_score"] = 1.0 - g["flow_out"] / g["flow_in"]
     return _rank_order(g)
 
 
@@ -510,7 +476,7 @@ def suggest_omega(term_values):
     Parameters
     ----------
     term_values : array-like of shape (n_clusters,)
-        Terminality scores, e.g. the ``Term`` column of :func:`cluster_terminality`.
+        Terminality scores, e.g. the ``terminality`` column of :func:`cluster_terminality`.
 
     Returns
     -------
@@ -554,12 +520,12 @@ def top_terminals(term, n_lineages):
     names : list of str
         The chosen terminal clusters, most terminal first.
     tied : list of str
-        Clusters sharing the Term score that straddles the cut, i.e. split
+        Clusters sharing the terminality score that straddles the cut, i.e. split
         arbitrarily rather than by the flow. Empty if the cut falls cleanly.
     """
     g = _rank_order(term)
     names = [str(i) for i in g.index[:n_lineages]]
-    v = g["Term"].to_numpy(float)
+    v = g["term_score"].to_numpy(float)
     tied = []
     if 0 < n_lineages < v.size and v[n_lineages - 1] == v[n_lineages]:
         tied = [str(i) for i in g.index[v == v[n_lineages]]]
@@ -608,12 +574,9 @@ def terminal_cells(adata, chain, cluster_key, terminal_clusters, q_quantile=0.0)
 def _flow_cluster_names(adata, cluster_key):
     """Cluster labels present, natural-sorted (``"10"`` after ``"9"``) for a stable,
     human-readable order; cosmetic only, cluster_flux_matrix builds its own index."""
+    from natsort import natsorted
     labs = {str(c) for c in adata.obs[cluster_key].astype(str).to_numpy()}
-    try:
-        from natsort import natsorted
-        return [str(c) for c in natsorted(labs)]
-    except ImportError:
-        return sorted(labs)
+    return [str(c) for c in natsorted(labs)]
 
 
 def cluster_flux_matrix(adata, cluster_key, cluster_names, flow_key="dt_flow",
@@ -637,7 +600,7 @@ def cluster_flux_matrix(adata, cluster_key, cluster_names, flow_key="dt_flow",
     flow_key : str, default "dt_flow"
         ``uns`` key of the QROT flow.
     edge_threshold : float, default 1e-6
-        Flow floor for an edge to count as active.
+        Minimum flow, as a fraction of the transported mass (supplies sum to 1), for an edge to count.
 
     Returns
     -------
@@ -648,16 +611,15 @@ def cluster_flux_matrix(adata, cluster_key, cluster_names, flow_key="dt_flow",
     """
     names = [str(c) for c in cluster_names]
     index = {c: i for i, c in enumerate(names)}
+    K = len(names)
     df = _cross_cluster_flux(adata, cluster_key, flow_key=flow_key,
                              edge_threshold=edge_threshold)
-    F = np.zeros((len(names), len(names)), float)
-    if len(df):
-        ok = df["src"].isin(index) & df["dst"].isin(index)
-        d = df[ok.to_numpy()]
-        if len(d):
-            ci = d["src"].map(index).to_numpy(np.int64)
-            cj = d["dst"].map(index).to_numpy(np.int64)
-            np.add.at(F, (ci, cj), d["j"].to_numpy(float))
+    d = df[(df["src"].isin(index) & df["dst"].isin(index)).to_numpy()]
+    ci = d["src"].map(index).to_numpy(np.int64)
+    cj = d["dst"].map(index).to_numpy(np.int64)
+    # astype: bincount of no edges comes back int64
+    F = np.bincount(ci * K + cj, weights=d["j"].to_numpy(float),
+                    minlength=K * K).reshape(K, K).astype(float, copy=False)
     return F, index
 
 
@@ -682,7 +644,7 @@ def net_flux_matrix(adata, cluster_key, cluster_names, flow_key="dt_flow",
     flow_key : str, default "dt_flow"
         ``uns`` key of the QROT flow.
     edge_threshold : float, default 1e-6
-        Flow floor for an edge to count as active.
+        Minimum flow, as a fraction of the transported mass (supplies sum to 1), for an edge to count.
 
     Returns
     -------
@@ -714,17 +676,14 @@ def _median_cluster_pt(adata, cluster_key, cluster_names, pt_key):
     """Median (not mean) pseudotime per cluster; median avoids off-LCC reconnection
     dragging a mean toward borrowed values. NaN where pt_key is absent or the
     cluster holds no finite value."""
-    out = np.full(len(cluster_names), np.nan)
+    import pandas as pd
     if pt_key not in adata.obs:
-        return out
+        return np.full(len(cluster_names), np.nan)
     lab = adata.obs[cluster_key].astype(str).to_numpy()
     v = adata.obs[pt_key].to_numpy(float)
-    for i, c in enumerate(cluster_names):
-        vals = v[lab == str(c)]
-        vals = vals[np.isfinite(vals)]
-        if vals.size:
-            out[i] = float(np.median(vals))
-    return out
+    med = pd.Series(np.where(np.isfinite(v), v, np.nan)).groupby(lab).median()
+    # + 0.0 turns pandas' -0.0 into the +0.0 np.median gives
+    return med.reindex([str(c) for c in cluster_names]).to_numpy(float) + 0.0
 
 
 def _meg(K, pairs, NET):
@@ -813,7 +772,7 @@ def cluster_graph(adata, cluster_key, flow_key="dt_flow", pt_key="pseudotime",
     simplify : bool, default True
         Run step 2. ``False`` keeps every candidate that survives the leak prune.
     edge_threshold : float, default 1e-6
-        Flow floor for an edge to count as active.
+        Minimum flow, as a fraction of the transported mass (supplies sum to 1), for an edge to count.
     enforce_acyclic : bool, default True
         Break cluster-level cycles by reversing the closing edge. ``False`` keeps every
         kept edge in its raw NET-sign direction, so a real cycle in the flow stays a
@@ -838,11 +797,8 @@ def cluster_graph(adata, cluster_key, flow_key="dt_flow", pt_key="pseudotime",
     if len(carriers) < 2:
         raise ValueError(
             f"Only {len(carriers)} cluster(s) carry cross-cluster flux "
-            f"({sorted(carriers)}), so there is no cluster trajectory to draw. Either "
-            f"obs['{cluster_key}'] labels everything the flow reaches as one cluster "
-            "(cluster at a finer resolution), or edge_threshold="
-            f"{edge_threshold:g} is above the flow on every boundary-crossing edge "
-            "(lower it)."
+            f"({sorted(carriers)}): cluster at a finer resolution, or lower "
+            f"edge_threshold={edge_threshold:g}."
         )
 
     names = _flow_cluster_names(adata, cluster_key)
@@ -858,10 +814,8 @@ def cluster_graph(adata, cluster_key, flow_key="dt_flow", pt_key="pseudotime",
     pairs = [(i, j) for i in range(K) for j in range(K) if NET[i, j] > 0.0]
     if not pairs:
         raise ValueError(
-            f"No net transport between any two clusters of obs['{cluster_key}']: every "
-            "cluster boundary carries exactly as much flow back as it does forward, so "
-            "NET cancels to zero everywhere and no edge can be oriented. This normally "
-            "means the flow is empty or stale: re-run qrot()."
+            f"No net flow between any two clusters of obs['{cluster_key}']: the flow is "
+            "empty or stale, so rerun tl.qrot."
         )
     cand = sorted(((i, j, float(NET[i, j])) for i, j in pairs),
                   key=lambda t: (-t[2], t[0], t[1]))
@@ -1027,10 +981,12 @@ def _widest_path(chain, JL_edges, JL, src_idx, dst_idx):
     """
     import heapq
     n = chain["n"]
-    adj = [[] for _ in range(n)]
-    for (a, c), w in zip(JL_edges, JL, strict=True):
-        if w > EPS:
-            adj[a].append((c, w))
+    # out-edges of cell v are nbr/wt[ptr[v]:ptr[v + 1]], in input order
+    k = JL > EPS
+    a = JL_edges[k, 0]
+    o = np.argsort(a, kind="stable")
+    nbr, wt = JL_edges[k, 1][o].tolist(), JL[k][o].tolist()
+    ptr = np.searchsorted(a[o], np.arange(n + 1)).tolist()
     cap = np.zeros(n); prev = np.full(n, -1)
     dst = set(np.asarray(dst_idx).tolist())
     h = []
@@ -1044,8 +1000,8 @@ def _widest_path(chain, JL_edges, JL, src_idx, dst_idx):
         seen[v] = True
         if v in dst:
             best = v; break
-        for u, w in adj[v]:
-            nc = min(c, w)
+        for i in range(ptr[v], ptr[v + 1]):
+            u = nbr[i]; nc = min(c, wt[i])
             if nc > cap[u] + EPS:
                 cap[u] = nc; prev[u] = v; heapq.heappush(h, (-nc, u))
     if best < 0:
@@ -1061,7 +1017,7 @@ def _widest_path(chain, JL_edges, JL, src_idx, dst_idx):
 # ---------------------------------------------------------------------------
 def lineages_from_chain(adata, source_idx, terminal_clusters, cluster_key,
                         flow_key="dt_flow", pt_key="pseudotime",
-                        edge_threshold=1e-6, suffix=""):
+                        edge_threshold=0, suffix=""):
     """Assign every cell a lineage and a confidence, and write them into ``adata``.
 
     Runs build_chain -> terminal_cells -> absorption, then writes the fate keys
@@ -1083,8 +1039,8 @@ def lineages_from_chain(adata, source_idx, terminal_clusters, cluster_key,
         ``obs`` column with the cluster labels.
     flow_key, pt_key : str
         ``uns`` / ``obs`` keys of the QROT flow and pseudotime.
-    edge_threshold : float, default 1e-6
-        Flow floor for an edge to count as active.
+    edge_threshold : float, default 0
+        Minimum flow for an edge to count; 0 keeps exactly the edges the optimal flow uses.
     suffix : str, default ""
         Appended to every written key, so several runs can live side by side.
 
@@ -1094,8 +1050,7 @@ def lineages_from_chain(adata, source_idx, terminal_clusters, cluster_key,
         ``chain`` plus ``A``, ``b``, ``F`` (see :func:`absorption`) and ``names``,
         the lineage names in column order.
     """
-    chain = build_chain(adata, source_idx, flow_key=flow_key, pt_key=pt_key,
-                        edge_threshold=edge_threshold)
+    chain = build_chain(adata, source_idx, flow_key=flow_key, edge_threshold=edge_threshold)
     groups = terminal_cells(adata, chain, cluster_key, terminal_clusters)
     groups = {str(k): v for k, v in groups.items() if len(v)}
     if not groups:
@@ -1211,7 +1166,7 @@ def cluster_trajectory(
     simplify : bool, default True
         Run step 2. ``False`` gives the leak prune alone, followed by steps 3 and 4.
     edge_threshold : float, default 1e-6
-        Active-edge floor defining the flow DAG, matching :func:`lineages`.
+        Minimum flow, as a fraction of the transported mass (supplies sum to 1), for an edge to count.
     enforce_acyclic : bool, default True
         Break cluster-level cycles by reversing the closing edge. Set ``False`` to
         keep every kept edge in its raw NET-sign direction instead --
@@ -1260,18 +1215,11 @@ def cluster_trajectory(
     if edge_rule not in ("meg", "theta"):
         raise ValueError(f"edge_rule must be 'meg' or 'theta', got {edge_rule!r}")
     if edge_rule == "theta" and (
-            isinstance(theta, bool) or not isinstance(theta, (int, float, np.integer, np.floating))):
-        raise ValueError(
-            f"theta must be a number strictly inside (0, 1), got {theta!r} "
-            f"({type(theta).__name__}); it is a fraction of the transported mass."
-        )
+            isinstance(theta, bool)
+            or not isinstance(theta, (int, float, np.integer, np.floating))
+            or not 0.0 < float(theta) < 1.0):
+        raise ValueError(f"theta must be a number strictly inside (0, 1), got {theta!r}.")
     theta_f = float(theta)
-    if edge_rule == "theta" and (not np.isfinite(theta_f) or not (0.0 < theta_f < 1.0)):
-        raise ValueError(
-            f"theta must lie strictly inside (0, 1), got {theta}. It is a FRACTION OF THE "
-            "TRANSPORTED MASS M, so theta=0 would keep every pair the flow touches at all "
-            "and theta>=1 can keep nothing, no single boundary carrying all of M."
-        )
     if adata.uns.get(flow_key) is None:
         raise ValueError(
             f"No flow data in adata.uns['{flow_key}']. Run qrot() with adata_basis set "
@@ -1304,5 +1252,5 @@ def cluster_trajectory(
         else:
             _log.detail("acyclicity guard: disabled, cycles may be present")
         if res["M_fallback"]:
-            _log.detail("M fell back to max|NET|: theta is NOT a fraction of transported mass")
+            _log.detail("M fell back to max|NET|, so theta is not a fraction of the transported mass")
     return res

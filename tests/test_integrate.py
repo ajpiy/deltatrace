@@ -334,3 +334,163 @@ def test_unreachable_cells_are_told_to_hold_a_placeholder():
     assert len(ours) == 1 and ours[0].filename == __file__
     pt = g.obs["pseudotime"].to_numpy()
     assert np.unique(pt[island]).size == 1                 # the one median value
+
+
+# --- distance formats: condensed (pp.wasserstein) or square, all read the same ------------
+
+def _bits(out):
+    """Every stored array of both integrated graphs, byte for byte."""
+    return [(k, m.indptr.tobytes(), m.indices.tobytes(), m.data.tobytes())
+            for k, m in sorted(out.obsp.items()) if k.startswith("neighbors_")]
+
+
+def _condensed(D, names):
+    from scipy.spatial.distance import squareform
+
+    return ad.AnnData(obs=pd.DataFrame(index=names), uns={"distances": squareform(D)})
+
+
+@pytest.fixture(scope="module")
+def crypt150():
+    adata, dist = dt.datasets.crypt(n=150)
+    return adata, np.asarray(dist.X), list(adata.obs_names)
+
+
+@pytest.mark.parametrize("form", ["dense", "sparse", "frame", "path", "condensed"])
+def test_every_distance_format_gives_the_same_graphs(crypt150, form, tmp_path):
+    import scipy.sparse as sp
+
+    adata, D, names = crypt150
+    obs = pd.DataFrame(index=names)
+    ref = dt.pp.graphs(adata, ad.AnnData(X=D, obs=obs, var=obs), verbose=0)
+    dist = {
+        "dense": lambda: ad.AnnData(X=D, obs=obs),
+        "sparse": lambda: ad.AnnData(X=sp.csr_matrix(D), obs=obs),
+        "frame": lambda: pd.DataFrame(D, index=names, columns=names),
+        "condensed": lambda: _condensed(D, names),
+    }.get(form)
+    if dist is None:
+        _condensed(D, names).write_h5ad(tmp_path / "d.h5ad")
+        dist = lambda: str(tmp_path / "d.h5ad")  # noqa: E731
+    assert _bits(dt.pp.graphs(adata, dist(), verbose=0)) == _bits(ref)
+
+
+def test_an_asymmetric_matrix_takes_the_larger_entry(crypt150):
+    adata, D, names = crypt150
+    rng = np.random.default_rng(0)
+    A = D * rng.uniform(0.5, 1.5, D.shape)
+    obs = pd.DataFrame(index=names)
+    out = dt.pp.graphs(adata, ad.AnnData(X=A, obs=obs), verbose=0)
+    ref = dt.pp.graphs(adata, _condensed(np.maximum(A, A.T), names), verbose=0)
+    assert _bits(out) == _bits(ref)
+
+
+def test_condensed_distances_are_realigned_by_name(crypt150):
+    adata, D, names = crypt150
+    ref = dt.pp.graphs(adata, _condensed(D, names), verbose=0)
+    perm = np.random.default_rng(1).permutation(len(names))
+    shuffled = _condensed(D[np.ix_(perm, perm)], [names[k] for k in perm])
+    out = dt.pp.graphs(adata, shuffled, verbose=0)
+    assert _bits(out) == _bits(ref)
+    shuffled.obs_names = ["x" + n for n in shuffled.obs_names]
+    with pytest.raises(ValueError, match="different cells"):
+        dt.pp.integrate(adata, shuffled, verbose=0)
+
+
+def test_nan_pairs_are_no_distance(crypt150):
+    """An undefined pair (NaN from pp.wasserstein) is what an absent entry is in a sparse
+    square matrix: no spatial edge."""
+    import scipy.sparse as sp
+
+    adata, D, names = crypt150
+    full = dt.pp.integrate(adata, _condensed(D, names), verbose=0)
+    kept = full.obsp["neighbors_intr_connectivities"].tocoo()
+    pairs = [(i, j) for i, j in zip(kept.row, kept.col, strict=True) if i < j][:20]
+    gap = D.copy()
+    for i, j in pairs:
+        gap[i, j] = gap[j, i] = 0.0
+    dist = _condensed(gap, names)
+    dist.uns["distances"][dist.uns["distances"] == 0] = np.nan
+    out = dt.pp.integrate(adata, dist, verbose=0)
+    obs = pd.DataFrame(index=names)
+    absent = ad.AnnData(X=sp.csr_matrix(gap), obs=obs)
+    assert _bits(out) == _bits(dt.pp.integrate(adata, absent, verbose=0))
+    assert not any(out.obsp["neighbors_intr_connectivities"][i, j] for i, j in pairs)
+
+
+def test_malformed_distance_objects_are_rejected(crypt150):
+    adata, D, names = crypt150
+    short = _condensed(D, names)
+    short.uns["distances"] = short.uns["distances"][:-1]
+    with pytest.raises(ValueError, match="pairs"):
+        dt.pp.integrate(adata, short, verbose=0)
+    frame = pd.DataFrame(D, index=names, columns=names[::-1])
+    with pytest.raises(ValueError, match="row and column labels"):
+        dt.pp.integrate(adata, frame, verbose=0)
+
+
+# --- distance 0 is the closest pair, not a missing one ------------------------------------
+
+_ZERO01 = np.array([[0.0, 0.0, 10.0], [0.0, 0.0, 6.0], [10.0, 6.0, 0.0]])
+_C01 = 0.5 / 0.8                                            # c0-c1 expression connectivity
+
+
+def _zero01(form):
+    """wd_matrix's distances with d(c0, c1) = 0, as ``form`` stores them."""
+    import scipy.sparse as sp
+
+    names = ["c0", "c1", "c2"]
+    obs = pd.DataFrame(index=names)
+    if form == "condensed":
+        return _condensed(_ZERO01, names)
+    if form == "sparse":
+        X = sp.csr_matrix(([0.0, 0.0, 10.0, 6.0, 10.0, 6.0], ([0, 1, 0, 1, 2, 2], [1, 0, 2, 2, 0, 1])),
+                          shape=(3, 3))
+        assert X.nnz == 6                                   # the zeros are stored
+        return ad.AnnData(X=X, obs=obs, var=obs)
+    return ad.AnnData(X=_ZERO01, obs=obs, var=obs)
+
+
+@pytest.mark.parametrize("form", ["dense", "sparse", "condensed"])
+@pytest.mark.parametrize("mode,graph", [("intersection", "intr"), ("expression", "expr")])
+def test_a_zero_distance_pair_keeps_its_edge_at_full_similarity(sc_with_knn, form, mode, graph):
+    out = dt.pp.integrate(sc_with_knn, _zero01(form), alpha=0.5, p_keep=0.5, mode=mode,
+                          verbose=False)
+    assert _conn(out, graph)[0, 1] == pytest.approx(0.5 * _C01 + 0.5 * 1.0)
+
+
+def test_an_absent_or_nan_pair_is_no_distance(sc_with_knn):
+    import scipy.sparse as sp
+
+    dense = _zero01("dense")
+    absent = ad.AnnData(X=sp.csr_matrix(_ZERO01), obs=dense.obs, var=dense.var)  # (c0, c1) absent
+    nan = _zero01("condensed")
+    nan.uns["distances"][0] = np.nan
+    for dist in (absent, nan):
+        intr = dt.pp.integrate(sc_with_knn, dist, alpha=0.5, p_keep=0.5, verbose=False)
+        expr = dt.pp.integrate(sc_with_knn, dist, alpha=0.5, p_keep=0.5, mode="expression",
+                               verbose=False)
+        assert _conn(intr)[0, 1] == 0
+        assert _conn(expr, "expr")[0, 1] == pytest.approx(0.5 * _C01)
+
+
+def test_the_p_keep_quantile_counts_zero_distances(sc_with_knn):
+    """[0, 0, 6, 6, 10, 10] at p_keep=0.3 is 3 (zeros counted), not 6 (positives only); only
+    the zero pair survives, at full similarity although the largest kept distance is 0."""
+    out = dt.pp.integrate(sc_with_knn, _zero01("dense"), alpha=0.5, p_keep=0.3, verbose=False)
+    params = out.uns["neighbors_intr"]["params"]
+    assert params["ext_dist_threshold_raw"] == pytest.approx(3.0)
+    assert params["ext_dist_max"] == 0.0
+    C = _conn(out)
+    assert C[0, 1] == pytest.approx(0.5 * _C01 + 0.5) and C[1, 2] == 0
+
+
+@pytest.mark.parametrize("form", ["dense", "sparse", "condensed"])
+def test_all_zero_distances_still_raise(sc_with_knn, form):
+    dist = _zero01(form)
+    if form == "condensed":
+        dist.uns["distances"][:] = 0.0
+    else:
+        dist.X = dist.X * 0.0                                # sparse keeps its stored zeros
+    with pytest.raises(ValueError, match="no nonzero entries"):
+        dt.pp.integrate(sc_with_knn, dist, verbose=False)

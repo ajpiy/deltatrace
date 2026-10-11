@@ -65,15 +65,17 @@ def crypt(
     ``["fate_A", "fate_B"]`` as the sinks.
 
     The expression kNN graph is a ladder: besides the links along each wall, it has
-    rungs straight across the lumen between cells of the same stage. With the default
-    geometry, the ``p_keep=0.32`` tissue radius of :func:`deltatrace.pp.graphs` comes out
-    near 4 units, shorter than the 5-unit lumen, so the intersection graph (``"intr"``)
-    cuts every rung. The walls stay joined through the base, which is one continuous
-    stretch of tissue whose cells are alike in expression, so ``"intr"`` is one
-    connected U. On it the flow runs up each wall and each wall's cells go to their own
-    top. On the expression graph the flow jumps the lumen, and most mid-wall cells are
-    left undecided between the two tops. The rungs come back once ``p_keep`` pushes the
-    radius past the lumen, just above ``p_keep=0.4``.
+    rungs straight across the lumen between cells of the same stage. The example uses
+    ``p_keep=0.32`` in :func:`deltatrace.pp.graphs`: with the default geometry the tissue
+    radius comes out near 4 units, shorter than the 5-unit lumen, so the intersection
+    graph (``"intr"``) cuts every rung. The walls stay joined through the base, which is
+    one continuous stretch of tissue whose cells are alike in expression, so ``"intr"``
+    is one connected U. On it the flow runs up each wall and each wall's cells go to
+    their own top. On the expression graph the flow jumps the lumen, and most mid-wall
+    cells are left undecided between the two tops. The rungs come back once ``p_keep``
+    pushes the radius past the lumen, just above ``p_keep=0.4``, so the package default
+    ``0.3`` cuts them too. For spatial data, calibrate by lowering ``p_keep`` until the
+    lumen is cut.
 
     Parameters
     ----------
@@ -151,9 +153,9 @@ def crypt(
     units, at a legible length. Scaling every length together changes no result,
     because :func:`deltatrace.pp.graphs` sets its radius as a quantile of all pairwise
     distances. Changing one length does: the radius is a quantile over the whole tissue,
-    so taller walls, a narrower lumen or thicker walls can push it past the lumen and
-    bring the rungs back (``wall_height=11`` or ``lumen_width=3`` already lets some flow
-    cross).
+    so taller walls, a narrower lumen or thicker walls can push the ``p_keep=0.32``
+    radius past the lumen and bring the rungs back (``wall_height=11`` or
+    ``lumen_width=3`` already lets some flow cross).
 
     Pseudotime is not where the tissue helps. Within each wall it tracks ``t`` about
     equally well on both graphs. But on ``"intr"`` each wall keeps only its own
@@ -166,7 +168,7 @@ def crypt(
     small ``n`` (Spearman with ``t`` about 0.96 against 0.99 at ``n=150``) and nearly
     ties at ``n=1000``.
 
-    At package defaults ``"intr"`` was one component in every one of 27,000 draws with
+    At ``p_keep=0.32`` ``"intr"`` was one component in every one of 27,000 draws with
     ``n`` from 40 to 1000. From about ``n=1200`` a single transit cell falls off it in
     about one draw in 150: a cell just past ``fork_start`` whose noise shows the other
     wall's marker, so that all its expression neighbors sit across the lumen.
@@ -201,9 +203,8 @@ def crypt(
         raise ValueError(f"crypt(): expr_noise must be >= 0, got {expr_noise}.")
     if n_false and n < 150:
         warnings.warn(
-            f"crypt(): with n={n} the false-fate patch is too small to fill its own "
-            f"{n_neighbors} expression neighbors, so some reach its own wall and 'intr' "
-            f"does not cut it off. Use n >= 150.",
+            f"crypt(): with n={n} the false-fate patch is too small for 'intr' to cut it "
+            "off; use n >= 150.",
             UserWarning,
             stacklevel=2,
         )

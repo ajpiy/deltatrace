@@ -1,6 +1,6 @@
 """DeltaTrace: spatially-regularized trajectory inference for scRNA-seq and spatial data.
 
-Cells are ordered by quadratically-regularized optimal transport (QROT) run on a
+Cells are ordered by quadratically regularized optimal transport (QROT) run on a
 cell-cell graph that physical distance has already constrained, so a cell only advances
 to a neighbor it is close to both in expression and in the tissue. One conic solve
 returns the dual potential, taken directly as pseudotime, and the primal directed flow,
@@ -31,7 +31,7 @@ done.
 >>> # endpoints -> qrot -> velocity -> lineages
 >>> _ = dt.tl.trajectory(ad_intg, ["progenitor"], ["fate_A", "fate_B"], basis="spatial")
 sampling source and sink endpoints ... finished (...)
-solving quadratically-regularized transport ... finished (...)
+solving quadratically regularized transport ... finished (...)
 building the velocity grid ... finished (...)
 assigning lineages by absorbing chain ... finished (...)
 done.

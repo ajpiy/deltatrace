@@ -105,9 +105,9 @@ def step(message: str, verbose):
         if lvl == 0:
             yield
             return
-        # Flushing the opening half at once splits the line in notebook front ends, which
-        # render each flush as its own output; there the kernel's periodic flush still shows
-        # a long step while it runs. A terminal gets it straight away.
+        # Not flushed in a notebook: a flushed half is saved as an output of its own (nbclient,
+        # papermill), which viewers draw on its own line; the kernel's periodic flush still
+        # shows a long step while it runs. A terminal gets it straight away.
         print(f"{message} ...{'' if lvl >= 2 else ' '}", end="\n" if lvl >= 2 else "",
               flush=_is_terminal())
         t0 = time.perf_counter()

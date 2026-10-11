@@ -159,8 +159,9 @@ def test_off_lcc_cells_are_not_left_nan_when_reconnect_is_off(basis_and_clust):
     pt = basis.obs["pseudotime"].to_numpy()
     island, lcc = pt[ISLAND], pt[LCC]
     assert np.isfinite(island).all(), "reconnect=False must NOT leave them NaN"
-    assert np.isfinite(basis.obs["pseudotime_raw"].to_numpy()[ISLAND]).all()
-    # the explicit placeholder, not whatever the solver's least-norm dual happened to be
+    # before it they had no potential (no source or sink in their piece): NaN
+    assert np.isnan(basis.obs["pseudotime_raw"].to_numpy()[ISLAND]).all()
+    # the explicit placeholder
     assert island == pytest.approx([float(np.median(lcc))] * len(ISLAND))
     # ...and the only thing that identifies them is the off-LCC bookkeeping, which the
     # caller has to consult and mask by; nothing in the written column does it for them.

@@ -63,19 +63,19 @@ def test_terminality_ranks_sink_top_and_drops_pure_source(graphed):
     obj = graphed.copy()
     _diffuse(obj)
     tab = dt.tl.terminality(obj, cluster_key="clusters", show=False)
-    assert "source" not in tab.index          # in==0 -> Term undefined -> dropped
+    assert "source" not in tab.index          # in==0 -> term_score undefined -> dropped
     assert tab.index[0] == "sink"             # the true terminal ranks highest
-    assert tab.loc["sink", "Term"] > tab.loc["mid", "Term"]
+    assert tab.loc["sink", "term_score"] > tab.loc["mid", "term_score"]
 
 
 def test_suggest_omega_finds_the_clear_gap(graphed):
     obj = graphed.copy()
     _diffuse(obj)
     tab = dt.tl.terminality(obj, cluster_key="clusters", show=False)
-    omega, info = _lineages.suggest_omega(tab["Term"].to_numpy())
+    omega, info = _lineages.suggest_omega(tab["term_score"].to_numpy())
     assert info["clear"]                                  # sink(1.0) vs mid(0.5): clear
-    assert tab.loc["mid", "Term"] < omega < tab.loc["sink", "Term"]
-    terminals = list(tab.index[tab["Term"] >= omega])
+    assert tab.loc["mid", "term_score"] < omega < tab.loc["sink", "term_score"]
+    terminals = list(tab.index[tab["term_score"] >= omega])
     assert terminals == ["sink"]
 
 
@@ -93,7 +93,7 @@ def test_lineages_discovers_the_terminal(graphed):
 def test_no_terminal_above_omega_errors(graphed):
     obj = graphed.copy()
     _diffuse(obj)
-    with pytest.raises(ValueError, match="No cluster has Term"):
+    with pytest.raises(ValueError, match="No cluster has term_score "):
         dt.tl.lineages(obj, ["source"], None, cluster_key="clusters", omega_term=2.0,
                        verbose=False)
 
@@ -199,7 +199,7 @@ def test_sink_weights_rejects_unknown_value(graphed):
 
 def _backflux_flow():
     """src -> mid -> sink with a small mid -> src back-edge, so the source has non-zero
-    inflow and Term_src = 1 - out/in = -9 (a large negative that hijacks the gap search)."""
+    inflow and term_score = 1 - flow_out/flow_in = -9 (a large negative that hijacks the gap search)."""
     obs = pd.DataFrame({"clusters": ["src", "mid", "sink"]}, index=["c0", "c1", "c2"])
     a = ad.AnnData(X=np.zeros((3, 2), np.float32), obs=obs)
     a.obs["pseudotime"] = [0.0, 0.5, 1.0]
@@ -211,18 +211,18 @@ def _backflux_flow():
 
 
 def test_terminality_source_exclusion_saves_the_gap_search():
-    """Without the source drop, Term_src=-9 opens the largest gap and suggest_omega falsely
+    """Without the source drop, the source's term_score of -9 opens the largest gap and suggest_omega falsely
     declares the interior cluster terminal; passing source_clusters recovers the true sink."""
     a = _backflux_flow()
     raw = dt.tl.terminality(a, cluster_key="clusters", show=False)
-    assert "src" in raw.index and raw.loc["src", "Term"] < -1        # the poison row
-    omega_bad, _ = _lineages.suggest_omega(raw["Term"].to_numpy())
-    assert "mid" in list(raw.index[raw["Term"] >= omega_bad])        # bug reproduced
+    assert "src" in raw.index and raw.loc["src", "term_score"] < -1        # the poison row
+    omega_bad, _ = _lineages.suggest_omega(raw["term_score"].to_numpy())
+    assert "mid" in list(raw.index[raw["term_score"] >= omega_bad])        # bug reproduced
 
     tab = dt.tl.terminality(a, cluster_key="clusters", source_clusters=["src"], show=False)
     assert "src" not in tab.index                                    # source dropped
-    omega, _ = _lineages.suggest_omega(tab["Term"].to_numpy())
-    assert list(tab.index[tab["Term"] >= omega]) == ["sink"]         # fixed
+    omega, _ = _lineages.suggest_omega(tab["term_score"].to_numpy())
+    assert list(tab.index[tab["term_score"] >= omega]) == ["sink"]         # fixed
 
 
 def test_source_only_lineages_ignore_backflux_source():

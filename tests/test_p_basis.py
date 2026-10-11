@@ -300,7 +300,7 @@ def test_lcc_basis_quotas_are_seed_dependent(pool_object):
     """
     seen = set()
     for seed in SEEDS:
-        with pytest.warns(UserWarning, match=r"get none: they take no part in the transport\.") as rec:
+        with pytest.warns(UserWarning, match=r"get none\. Raise p_end") as rec:
             qs, _, _ = _quotas(pool_object, ["A", "B", "C"], ["rare"], p_end=0.01,
                                seed=seed, sampling_mode="random", p_basis="lcc")
         assert not any("lineages" in str(w.message) for w in rec)

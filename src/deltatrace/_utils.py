@@ -40,8 +40,8 @@ def _resolve_graph(adata, graph=None):
         return candidates[0]
     if not candidates:
         raise ValueError(
-            "No DeltaTrace graph found. Run dt.pp.graphs(adata, adata_dist) first, or "
-            "dt.pp.graphs(adata) for the expression graph alone (no spatial input)."
+            "No DeltaTrace graph found: run dt.pp.graphs(adata, adata_dist), or "
+            "dt.pp.graphs(adata) without spatial input."
         )
     raise ValueError(
         f"Multiple integrated graphs found: {candidates}. Pass graph= explicitly."
@@ -67,12 +67,19 @@ def _as_labels(clusters, name):
 
 
 def _check_labels(adata, cluster_key, **roles):
-    """Fail early and clearly when obs[cluster_key] is missing or a role's labels are not in
-    it, rather than later as a bare KeyError or an empty-pool error."""
+    """Fail early and clearly when obs[cluster_key] is missing, obs_names repeat, or a role's
+    labels are not in it, rather than later as a bare KeyError or an empty-pool error."""
     if cluster_key not in adata.obs:
         raise KeyError(
             f"No column {cluster_key!r} in adata.obs to read the cluster labels from. Pass "
             f"cluster_key=<column>; obs has {list(adata.obs.columns)[:12]}."
+        )
+    # Labels reach cells by name, so a repeated name cannot be matched to one cell.
+    if not adata.obs_names.is_unique:
+        dup = adata.obs_names[adata.obs_names.duplicated()].unique()
+        raise ValueError(
+            f"adata.obs_names repeats {len(dup)} name(s), e.g. {list(dup[:5])}: make "
+            "them unique (AnnData.obs_names_make_unique)."
         )
     present = set(adata.obs[cluster_key].astype(str))
     for role, clusters in roles.items():
@@ -106,13 +113,12 @@ def _off_lcc_mask(adata, graph=None):
     try:
         graph = _resolve_graph(adata, graph)
         dist_key = adata.uns[f"neighbors_{graph}"]["distances_key"]
-        D = adata.obsp[dist_key].tocsr()
+        D = adata.obsp[dist_key].tocsr().copy()
     except (ValueError, KeyError):
         return None
 
-    D = (D + D.T) / 2
-    if D.diagonal().any():           # setdiag on an empty diagonal inserts zeros (scipy<1.13 warns)
-        D.setdiag(0)
+    # directed=False already joins i-j when either direction is stored, and a self-loop
+    # joins nothing. Explicit zeros would count as edges, so drop them (on the copy).
     D.eliminate_zeros()
     _, labels = csg.connected_components(D, directed=False)
     if labels.size == 0:
@@ -134,10 +140,8 @@ def _check_costs(D, dist_key):
     n_negative = int((data < 0).sum())            # NaN < 0 is False, so no double count
     if n_nonfinite or n_negative:
         raise ValueError(
-            f"obsp['{dist_key}'] holds {n_nonfinite} non-finite and {n_negative} negative "
-            "edge cost(s); every cost must be finite and >= 0. pp.integrate() never "
-            "writes such values, so this matrix was built or modified by hand -- fix it "
-            "(drop the edge, or set a positive cost) before running endpoints/qrot."
+            f"obsp['{dist_key}'] has {n_nonfinite} non-finite and {n_negative} negative "
+            "edge cost(s); costs must be finite and >= 0."
         )
 
 
@@ -182,14 +186,12 @@ def _build_digraph(adata: ad.AnnData, graph: str | None = None) -> nx.DiGraph:
 
     G = nx.from_scipy_sparse_array(D, create_using=nx.DiGraph, edge_attribute="cost")
 
+    # networkx skips the pairs that are not edges of G
     A_coo = A.tocoo()
     nx.set_edge_attributes(
         G,
-        {
-            (int(u), int(v)): float(w)
-            for u, v, w in zip(A_coo.row, A_coo.col, A_coo.data, strict=True)
-            if G.has_edge(int(u), int(v))
-        },
+        dict(zip(zip(A_coo.row.tolist(), A_coo.col.tolist(), strict=True),
+                 A_coo.data.tolist(), strict=True)),
         name="weight",
     )
 

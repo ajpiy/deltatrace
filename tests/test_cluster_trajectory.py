@@ -705,12 +705,12 @@ def test_plot_dashes_the_edges_the_guard_reversed(reentrant):
 
 # --------------------------------------------------------------- shared refactor
 def test_terminality_and_the_cluster_graph_read_one_edge_frame(forked):
-    """The in/out totals behind Term_i are the row/column sums of the same gross flux."""
+    """The flow_in/flow_out totals behind term_score are the row/column sums of the same gross flux."""
 
     tab = _lineages.cluster_terminality(forked, None, "clusters")
     F, index = _lineages.cluster_flux_matrix(forked, "clusters",
                                           _lineages._flow_cluster_names(forked, "clusters"))
     for name, row in tab.iterrows():
         i = index[str(name)]
-        assert row["inf"] == pytest.approx(F[:, i].sum())
-        assert row["out"] == pytest.approx(F[i, :].sum())
+        assert row["flow_in"] == pytest.approx(F[:, i].sum())
+        assert row["flow_out"] == pytest.approx(F[i, :].sum())

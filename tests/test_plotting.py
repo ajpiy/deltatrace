@@ -224,12 +224,13 @@ def test_pseudotime_nan_cells_are_drawn_in_na_color_underneath(run):
     obj.obs.loc[obj.obs_names[:7], "pseudotime"] = np.nan
     _, ax = dt.pl.pseudotime(obj, basis="spatial", arrows="none", show=False,
                              na_color="#0a0b0c")
-    na = [c for c in ax.collections if len(c.get_offsets()) == 7]
-    assert len(na) == 1
-    assert np.allclose(na[0].get_facecolor()[0], to_rgba("#0a0b0c"))
-    finite = [c for c in ax.collections if len(c.get_offsets()) == obj.n_obs - 7]
-    assert len(finite) == 1 and na[0].get_zorder() < finite[0].get_zorder()
-    assert not np.isnan(np.asarray(finite[0].get_array(), float)).any()
+    # One collection, NaN cells first (drawn underneath); it is the colorbar mappable the
+    # docstring points to as ax.collections[0].
+    scat = ax.collections[0]
+    assert len(scat.get_offsets()) == obj.n_obs
+    vals = np.asarray(scat.get_array(), float)
+    assert np.isnan(vals[:7]).all() and not np.isnan(vals[7:]).any()
+    assert np.allclose(scat.to_rgba(vals[:7]), to_rgba("#0a0b0c"))
 
 
 def test_pseudotime_colorbar_and_limits_are_controllable(run):

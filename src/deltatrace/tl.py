@@ -6,12 +6,12 @@ Holds :func:`endpoints`,
 :func:`cluster_trajectory` (the flow's own cluster-level graph); :func:`trajectory` runs
 the first four in one call, and every stage stays public rather than reachable only
 through that wrapper. :class:`CellGraph` is the cell graph :func:`endpoints` hands to
-:func:`qrot`.
+:func:`qrot`. :func:`qrot_graph` runs the same solver on any graph in SciPy's csgraph form.
 """
 
 from ._endpoints import endpoints
 from ._lineages import cluster_trajectory, lineages, terminality, widest_path
-from ._transport import compute_velocity_grid, qrot, trajectory
+from ._transport import compute_velocity_grid, qrot, qrot_graph, trajectory
 from ._utils import CellGraph
 
 __all__ = [
@@ -19,6 +19,7 @@ __all__ = [
     "endpoints",
     "CellGraph",
     "qrot",
+    "qrot_graph",
     "compute_velocity_grid",
     "lineages",
     "terminality",

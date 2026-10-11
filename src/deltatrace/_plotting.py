@@ -9,11 +9,14 @@ is also a plain ``obs`` column, so ``scanpy.pl.embedding`` works on the same obj
 
 from __future__ import annotations
 
+import itertools
 import warnings
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
+import pandas as pd
 
 from ._utils import _PKG_DIR, CellGraph, _renamed_kwargs, _resolve_basis, _resolve_graph, _suffix
 
@@ -77,31 +80,31 @@ def _warn_if_scanpy_resolves_basis_differently(adata, basis):
         a, b = np.asarray(adata.obsm[x_key]), np.asarray(adata.obsm[bare])
         if a.shape != b.shape or not np.array_equal(a, b):
             warnings.warn(
-                f"adata.obsm has both {x_key!r} and {bare!r} with different values. "
-                f"DeltaTrace (and this velocity grid) uses {x_key!r}; scanpy's "
-                f"basis={bare!r} would use {bare!r}. Pass basis={x_key!r} to "
-                "scanpy so the cells and the arrows share coordinates.",
+                f"obsm[{x_key!r}] and obsm[{bare!r}] differ, and the velocity grid uses "
+                f"{x_key!r}. Pass basis={x_key!r} to scanpy too.",
                 UserWarning, stacklevel=3,
             )
 
 
 def _scatter_values(ax, coords, values, *, cmap, vmin, vmax, size, na_color, zorder=2,
                     **kwargs):
-    """Scatter cells colored by ``values``; non-finite values are drawn UNDERNEATH in
-    ``na_color`` instead of vanishing (matplotlib's "bad" color is transparent).
+    """Scatter cells colored by ``values`` in one collection; non-finite values are drawn
+    first (so underneath) in ``na_color`` instead of vanishing (matplotlib's default "bad"
+    color is transparent).
 
-    Returns the mappable of the finite cells (``None`` if there are none), for a colorbar.
+    Returns that collection, for a colorbar; ``None`` if no value is finite.
     """
     values = np.asarray(values, dtype=float)
     finite = np.isfinite(values)
-    if (~finite).any():
-        ax.scatter(coords[~finite, 0], coords[~finite, 1], c=na_color, s=size,
-                   edgecolors="none", zorder=zorder - 0.5, **kwargs)
     if not finite.any():
+        ax.scatter(coords[:, 0], coords[:, 1], c=na_color, s=size, edgecolors="none",
+                   zorder=zorder - 0.5, **kwargs)
         return None
-    return ax.scatter(coords[finite, 0], coords[finite, 1], c=values[finite], cmap=cmap,
+    o = np.argsort(finite, kind="stable")                 # non-finite first
+    return ax.scatter(coords[o, 0], coords[o, 1], c=values[o],
+                      cmap=mpl.colormaps.get_cmap(cmap).with_extremes(bad=na_color),
                       vmin=vmin, vmax=vmax, s=size, edgecolors="none", zorder=zorder,
-                      **kwargs)
+                      plotnonfinite=True, **kwargs)
 
 
 def _draw_velocity(ax, adata, grid, *, kind, coord_scale, arrow_scale, arrow_width,
@@ -220,9 +223,8 @@ def velocity(
     grid_basis = str(grid["basis"])
     if basis is not None and str(basis) not in (grid_basis, f"X_{grid_basis}"):
         raise ValueError(
-            f"velocity: the grid in uns['{grid_key}'] was computed on basis="
-            f"{grid_basis!r}, so it cannot be drawn on {basis!r}. Re-run "
-            f"deltatrace.tl.compute_velocity_grid(adata, basis={basis!r}) first."
+            f"The velocity grid was computed on basis={grid_basis!r}, not {basis!r}: run "
+            f"tl.compute_velocity_grid(adata, basis={basis!r}) first."
         )
 
     if ax is None:
@@ -503,8 +505,8 @@ def endpoints(
     except KeyError:
         # No such embedding: lay the graph out instead.
         warnings.warn(
-            f"No embedding {basis!r} in obsm: laying the cell graph out with a spring layout "
-            "instead, which is slow on large data. Pass basis=<an obsm embedding>.",
+            f"No embedding {basis!r} in obsm: using a spring layout, which is slow on "
+            "large data. Pass basis= to choose an embedding.",
             UserWarning, skip_file_prefixes=(_PKG_DIR,),
         )
         G_nx = G.to_networkx() if isinstance(G, CellGraph) else G   # layout is networkx
@@ -608,6 +610,7 @@ def lineages(
     cmap : str, default "okabe_ito"
         Colors for lineages not named in ``lineage_colors``: the colorblind-safe
         Okabe-Ito palette (up to 8 lineages, else ``tab20``), or any matplotlib colormap.
+        A listed colormap repeats its colors when there are more lineages than colors.
     unassigned_color : str, default "lightgray"
         Color for cells reaching no declared terminal.
     confidence_alpha : bool, default True
@@ -635,8 +638,6 @@ def lineages(
     tuple or None
         ``(fig, ax)`` with ``show=False``; ``None`` once the figure is shown.
     """
-    import matplotlib as mpl
-
     sfx = _suffix(key_added)
     lin_key, conf_key = f"lineage{sfx}", f"lineage_confidence{sfx}"
     if lin_key not in adata.obs:
@@ -663,7 +664,7 @@ def lineages(
     if cmap == "okabe_ito":
         palette = dict(zip(names, _OKABE_ITO, strict=False))
     elif hasattr(mpl.colormaps[cmap], "colors"):
-        palette = dict(zip(names, mpl.colormaps[cmap].colors[: len(names)], strict=False))
+        palette = dict(zip(names, itertools.cycle(mpl.colormaps[cmap].colors)))
     else:
         palette = {n: mpl.colormaps[cmap](i / max(len(names) - 1, 1)) for i, n in enumerate(names)}
     if lineage_colors:
@@ -774,7 +775,8 @@ def _graph_layout(res, n, layout, seed, kwds=None):
         lo, hi = np.nanmin(pt[np.isfinite(pt)]), np.nanmax(pt[np.isfinite(pt)])
         x = (pt - lo) / (hi - lo) if hi > lo else np.zeros_like(pt)
         x = np.where(np.isfinite(x), x, 0.0)
-        y = np.array([nx.kamada_kawai_layout(G)[i][1] for i in range(n)], float)
+        pos = nx.kamada_kawai_layout(G)
+        y = np.array([pos[i][1] for i in range(n)], float)
         return np.column_stack([x, y])
 
     fn = fns[layout]
@@ -873,7 +875,6 @@ def cluster_trajectory(
     tuple or None
         ``(fig, ax)`` with ``show=False``; ``None`` once the figure is shown.
     """
-    import matplotlib as mpl
     import matplotlib.colors as mcolors
 
     sfx = _suffix(key_added)
@@ -886,9 +887,8 @@ def cluster_trajectory(
             grid = adata.uns.get(f"dt_grid{sfx}")
             if grid is None or "basis" not in grid:
                 raise ValueError(
-                    f"basis is None and adata.uns['dt_grid{sfx}'] records none to fall "
-                    "back on. Pass basis= explicitly (e.g. basis='umap'), or layout= to "
-                    "position nodes from the graph instead."
+                    f"basis is None and uns['dt_grid{sfx}'] records none: pass basis= "
+                    "(e.g. 'umap') or layout=."
                 )
             basis = grid["basis"]
         coords = np.asarray(_resolve_basis(adata, basis), float)
@@ -899,11 +899,9 @@ def cluster_trajectory(
     graph_key = res.get("cluster_key")
     if graph_key is not None and str(graph_key) != str(cluster_key):
         raise ValueError(
-            f"pl.cluster_trajectory: cluster_key={cluster_key!r} but "
-            f"uns['dt_cluster_trajectory{sfx}'] was computed on {str(graph_key)!r}, so its "
-            f"nodes do not describe obs[{cluster_key!r}] and every one of them would land "
-            f"on the wrong cells. Pass cluster_key={str(graph_key)!r} to draw the graph "
-            f"that was computed, or re-run tl.cluster_trajectory on {cluster_key!r}."
+            f"cluster_key={cluster_key!r}, but the cluster trajectory was computed on "
+            f"{str(graph_key)!r}: pass cluster_key={str(graph_key)!r}, or rerun "
+            f"tl.cluster_trajectory on {cluster_key!r}."
         )
 
     names = [str(c) for c in res["names"]]
@@ -912,18 +910,17 @@ def cluster_trajectory(
     missing = [n for n in names if n not in present]
     if missing:
         raise ValueError(
-            f"pl.cluster_trajectory: obs['{cluster_key}'] does not contain "
-            f"{missing[:5]}, which uns['dt_cluster_trajectory{sfx}'] was computed on, so "
-            "every node would be placed on the wrong cells. Pass the cluster_key the "
-            "graph was computed from, or re-run tl.cluster_trajectory on this column."
+            f"The cluster trajectory's clusters {missing[:5]} are not in "
+            f"obs['{cluster_key}']: pass the cluster_key it was computed on, or rerun "
+            "tl.cluster_trajectory."
         )
 
     # Node position: the MEDIAN of the cluster's coordinates, not the mean, since
     # reconnection-backfilled cells sit wherever the tissue put them and can drag a
     # mean centroid outside the cluster entirely.
     if layout is None:
-        node_pos = np.array([np.median(coords[(labels == n).to_numpy()], axis=0)
-                             for n in names])
+        node_pos = (pd.DataFrame(coords).groupby(labels.to_numpy(), sort=False).median()
+                    .loc[names].to_numpy())
     else:
         node_pos = _graph_layout(res, len(names), layout, layout_seed, layout_kwds)
 
@@ -934,8 +931,7 @@ def cluster_trajectory(
     if np.isfinite(pt_vals).any():
         finite = pt_vals[np.isfinite(pt_vals)]
         norm = mcolors.Normalize(vmin=float(finite.min()), vmax=float(finite.max()))
-        node_colors = [cmap_fn(norm(v)) if np.isfinite(v) else "lightgray"
-                       for v in pt_vals]
+        node_colors = cmap_fn.with_extremes(bad="lightgray")(norm(np.ma.masked_invalid(pt_vals)))
     else:                                   # no pseudotime column: one neutral color
         node_colors = ["lightgray"] * len(names)
 
@@ -1013,7 +1009,7 @@ def cluster_trajectory(
         node_pos[:, 1].min() - node_pad * y_span,
         node_pos[:, 1].max() + node_pad * y_span,
     )
-    ax.set_aspect("equal", adjustable="datalim")
+    ax.set_aspect("equal", adjustable="box")    # keep the padded limits; the box fits them
     ax.axis("off")
 
     if title:

@@ -5,7 +5,11 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
+import scipy.sparse.csgraph as csg
+import scipy.sparse.linalg as spla
+from scipy.optimize import linprog, minimize
 
 from . import _log
 from ._endpoints import endpoints
@@ -38,8 +42,6 @@ def _reconnect_pseudotime(
     """Give every off-LCC cell the pseudotime of its nearest connected cell, by
     Dijkstra on the reconnect_graph graph (unreachable cells fall back to the LCC
     median). Returns the full {cell name: pseudotime} mapping."""
-    import scipy.sparse.csgraph as csg
-
     disc_mask = _off_lcc_mask(adata_basis, graph)
 
     if disc_mask is None:
@@ -59,22 +61,18 @@ def _reconnect_pseudotime(
         _log.detail("No off-LCC nodes: all pseudotimes already assigned.")
         return dict(pt_dict)
 
-    name_to_idx = {name: i for i, name in enumerate(adata_clust.obs_names)}
+    clust_names = adata_clust.obs_names
+    name_to_idx = {name: i for i, name in enumerate(clust_names)}
 
-    connected_names_list = [
-        n for n in adata_clust.obs_names if n not in set(disc_names) and n in pt_dict
-    ]
-    connected_indices = [name_to_idx[n] for n in connected_names_list]
+    donor = ~clust_names.isin(disc_names) & clust_names.isin(list(pt_dict))
+    connected_names_list = list(clust_names[donor])
+    connected_indices = np.flatnonzero(donor)
 
     dist_key = _graph_distances_key(adata_clust, reconnect_graph)
     if dist_key is None:
         raise ValueError(
-            f"No graph {reconnect_graph!r} in adata_clust to reconnect off-LCC cells "
-            f"through: neither obsp['neighbors_{reconnect_graph}_distances'] (a DeltaTrace "
-            f"graph, e.g. reconnect_graph='expr' from pp.graphs) nor a scanpy graph stored "
-            f"with key_added={reconnect_graph!r}. There is deliberately no fallback to "
-            f"obsp['distances'], so a mis-specified graph cannot degrade reconnection "
-            f"geodesics quietly."
+            f"No graph {reconnect_graph!r} to reconnect off-LCC cells through. Pass a graph "
+            "from pp.graphs (e.g. reconnect_graph='expr') or a scanpy key_added."
         )
     D_clust = adata_clust.obsp[dist_key].tocsr()
 
@@ -84,24 +82,29 @@ def _reconnect_pseudotime(
     dist_sym.eliminate_zeros()
 
     _targets = [n for n in sorted(disc_names) if n in name_to_idx]
+    if _targets and not connected_indices.size:
+        raise ValueError(
+            "No LCC cell of adata_clust has a pseudotime: no donor to reconnect the "
+            f"{len(_targets)} off-LCC cells from."
+        )
     _log.detail(f"Reconnecting {len(_targets)} off-LCC cells from "
                 f"{len(connected_indices)} LCC donors...")
-    D_geodesic = csg.dijkstra(dist_sym, indices=[name_to_idx[n] for n in _targets])
-    # column order is connected_indices, so argmin resolves a tie to the first donor
-    D_to_donors = D_geodesic[:, connected_indices]
+    # Each target's distance to its nearest donor, then one Dijkstra from the target cut
+    # just past it: argmin over the donors in obs order resolves a tie to the first donor.
+    # The 1e-9 slack only absorbs the two directions summing a path in a different order.
+    d_nearest = csg.dijkstra(dist_sym, indices=connected_indices, min_only=True)
 
     pseudotime_full = dict(pt_dict)
     assigned = 0
     fallback = []
 
-    for row, disc_name in enumerate(_targets):
-        dists = D_to_donors[row]
-        nearest_j = int(np.argmin(dists))
-        nearest_dist = dists[nearest_j]
-
-        if nearest_dist < np.inf:
+    for disc_name in _targets:
+        t = name_to_idx[disc_name]
+        if np.isfinite(d_nearest[t]):
+            limit = d_nearest[t] * (1 + 1e-9) + 1e-300
+            dists = csg.dijkstra(dist_sym, indices=t, limit=limit)[connected_indices]
             pseudotime_full[disc_name] = pseudotime_full[
-                connected_names_list[nearest_j]
+                connected_names_list[int(np.argmin(dists))]
             ]
             assigned += 1
         else:
@@ -114,10 +117,8 @@ def _reconnect_pseudotime(
             pseudotime_full[disc_name] = median_pt
         warnings.warn(
             f"{len(fallback)} cell(s) outside the '{graph}' graph's largest connected "
-            f"component cannot be reached through reconnect_graph={reconnect_graph!r} "
-            f"either: they got the connected cells' median pseudotime ({median_pt:.3g}) as "
-            f"a placeholder, not an inferred position (they are listed in the endpoints "
-            f"result's 'disconnected_info').",
+            f"component are unreachable through reconnect_graph={reconnect_graph!r} too; "
+            f"they get the median pseudotime ({median_pt:.3g}) as a placeholder.",
             UserWarning,
             skip_file_prefixes=(_PKG_DIR,),
         )
@@ -167,8 +168,175 @@ def _median_off_lcc_pseudotime(adata_basis, pt_dict: dict, graph: str | None = N
     return pt_full
 
 
+# ---------------------------------------------------------------------------
+# QROT solver: the dual, by SciPy (trust region, Newton, midpoint of the free potentials)
+# ---------------------------------------------------------------------------
+def _solve_qrot(tail, head, c, f, tau, gtol=1e-4, tol=1e-12, eps=1e-8, max_iter=300):
+    """Optimal flow J and potentials p of the QROT dual (see qrot)."""
+    if not (np.isfinite(tau) and tau > 0):
+        raise ValueError(f"tau must be a positive finite number, got {tau!r}.")
+    n, m = len(f), len(tail)
+    scale = np.abs(f).max()
+
+    # demand must balance on every graph piece
+    _, lab = csg.connected_components(sp.coo_matrix((np.ones(m), (tail, head)), shape=(n, n)), directed=False)
+    if scale == 0 or np.any(np.abs(np.bincount(lab, f)) > tol * scale * np.bincount(lab)):
+        raise ValueError("The demand (sinks minus sources) is zero or does not balance on a connected piece "
+                         "of the graph.")
+
+    def flow(p):
+        return np.maximum(p[head] - p[tail] - c, 0.0) / tau
+
+    def residual(J):
+        return f - np.bincount(head, J, minlength=n) + np.bincount(tail, J, minlength=n)
+
+    def gain(p, d, t, r):
+        # dual(p + t d) - dual(p), summed per edge to avoid cancellation
+        s0 = p[head] - p[tail] - c
+        ds = t * (d[head] - d[tail])
+        s1 = s0 + ds
+        on0, on1 = s0 > 0, s1 > 0
+        term = np.where(on0 & on1, -ds**2, 0.0)
+        term = np.where(on0 & ~on1, s0 * (2 * ds + s0), term)
+        term = np.where(~on0 & on1, -s1**2, term)
+        return t * (r @ d) + term.sum() / (2 * tau)
+
+    # tau continuation near the LP limit (tau max|f| < max c / 10)
+    k = max(np.ceil(np.log10(0.1 * c.max() / (tau * scale))), 0) if c.max() > 0 else 0
+    taus = tau * 10.0 ** np.arange(k, -1, -1)
+    tau = taus[0]
+
+    # start: shortest-path distance from the sources
+    G = sp.csr_matrix((c, (tail, head)), shape=(n, n))
+    dist = csg.dijkstra(G, indices=np.flatnonzero(f < 0), min_only=True)
+    reached = np.isfinite(dist)
+    p = np.where(reached, dist, dist[reached].max())
+
+    # trust region (state cached per point); its model uses Newton's edges, s > -eps, so the shortest-path
+    # edges at their cost give it curvature from the start
+    cache = {}
+
+    def state(p):
+        if not np.array_equal(cache.get("p"), p):
+            s = p[head] - p[tail] - c
+            a = s > -eps
+            cache.update(p=p.copy(), J=np.maximum(s, 0.0) / tau, tail=tail[a], head=head[a])
+        return cache
+
+    def neg_dual(p):
+        J = state(p)["J"]
+        return -(f @ p - 0.5 * tau * (J @ J)) / scale
+
+    def hessp(p, v):
+        st = state(p)
+        dv = (v[st["head"]] - v[st["tail"]]) / tau
+        return (np.bincount(st["head"], dv, minlength=n) - np.bincount(st["tail"], dv, minlength=n)) / scale
+
+    tr = minimize(neg_dual, p, jac=lambda p: -residual(state(p)["J"]) / scale,
+                  hessp=hessp, method="trust-krylov", options=dict(gtol=gtol, maxiter=1000))
+    p = tr.x
+
+    # newton refinement
+    for tau in taus:
+        for _ in range(max_iter):
+            s = p[head] - p[tail] - c
+            r = residual(np.maximum(s, 0.0) / tau)
+            # converged: residual below tol or within rounding
+            rnd = np.finfo(float).eps * (np.abs(p[head]) + np.abs(p[tail]))
+            w = np.where(s > -rnd, rnd / tau, 0.0)
+            if np.all(np.abs(r) <= tol * scale + np.bincount(head, w, minlength=n) + np.bincount(tail, w, minlength=n)):
+                break
+
+            # hessian: laplacian of the active edges
+            a = s > -eps
+            A = sp.coo_matrix((np.full(a.sum(), 1.0 / tau), (tail[a], head[a])), shape=(n, n))
+            L = csg.laplacian((A + A.T).tocsr()).tocsr()
+
+            # newton step per piece, grounded at one cell
+            k, lab = csg.connected_components(L, directed=False)
+            size = np.bincount(lab)
+            mean = np.bincount(lab, r) / size
+            mean[np.abs(mean) <= tol * scale] = 0.0
+            idx = np.flatnonzero(L.diagonal() > 0)
+            _, first = np.unique(lab[idx], return_index=True)
+            free = np.setdiff1d(idx, idx[first])
+            d = np.zeros(n)
+            d[free] = spla.splu(L[free][:, free].tocsc(), permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0,
+                                options=dict(SymmetricMode=True)).solve((r - mean[lab])[free])
+
+            # shift pieces with a net residual until a boundary edge opens
+            if mean.any():
+                cut = lab[tail] != lab[head]
+                gap_in, gap_out = np.full(k, np.inf), np.full(k, np.inf)
+                np.minimum.at(gap_in, lab[head[cut]], -s[cut])
+                np.minimum.at(gap_out, lab[tail[cut]], -s[cut])
+                move = np.where(mean > 0, gap_in, np.where(mean < 0, -gap_out, 0.0)) + tau * mean * size
+                move = np.where(np.isfinite(move), move, 0.0) - np.where(mean != 0, np.bincount(lab, d) / size, 0.0)
+                d += move[lab]
+
+            # armijo line search
+            t, slope = 1.0, r @ d
+            while gain(p, d, t, r) < 1e-4 * t * slope and t > 1e-12:
+                t /= 2
+            p = p + t * d
+        else:
+            B = sp.coo_matrix((np.r_[-np.ones(m), np.ones(m)], (np.r_[tail, head], np.r_[np.arange(m), np.arange(m)])), shape=(n, m))
+            if linprog(np.zeros(m), A_eq=B, b_eq=f / scale, method="highs").status == 2:
+                raise ValueError("The demand is infeasible: along the edge directions, the sources' mass cannot reach the sinks.")
+            raise RuntimeError(f"QROT did not converge: Kirchhoff residual {np.abs(r).max():.2e} after {max_iter} Newton steps")
+
+    # zero unresolvable flows, then center the free potentials
+    J = flow(p)
+    J[J <= tol * scale + np.finfo(float).eps * (np.abs(p[head]) + np.abs(p[tail])) / tau] = 0.0
+    off = np.abs(residual(J)).max()
+    _log.detail(f"solver: dual trust region ({tr.nit} steps) + Newton, Kirchhoff residual {off:.1e}")
+    if off > 1e-6 * scale:
+        warnings.warn(f"The flow misses the demand by {off / scale:.0e} of its size, below the solver's "
+                      "resolution: raise tau, or scale the costs and masses toward 1.",
+                      RuntimeWarning, skip_file_prefixes=(_PKG_DIR,))
+    return J, _midpoint_free_potentials(tail, head, c, J, p, tau)
+
+
+def _midpoint_free_potentials(tail, head, c, J, p, tau):
+    """Potentials the flow leaves free, at the midpoint of their optimal range; NaN where unbounded."""
+    n, on = len(p), J > 0
+    if not on.any():
+        return np.full(n, np.nan)
+
+    # slack of every edge at p (>= 0), plus zero-slack reverse edges along the flow; parallel edges keep the smallest
+    t, h = np.r_[tail, head[on]], np.r_[head, tail[on]]
+    s = np.r_[np.maximum(c + tau * J - (p[head] - p[tail]), 0.0), np.zeros(on.sum())]
+    o = np.lexsort((s, h, t))
+    o = o[np.r_[True, (np.diff(t[o]) != 0) | (np.diff(h[o]) != 0)]]
+    G = sp.csr_matrix((s[o], (t[o], h[o])), shape=(n, n))
+
+    # reference: one flow group per graph piece
+    cells = np.unique(np.r_[tail[on], head[on]])
+    _, group = csg.connected_components(sp.coo_matrix((np.ones(on.sum()), (tail[on], head[on])), shape=(n, n)), directed=False)
+    _, piece = csg.connected_components(sp.coo_matrix((np.ones(len(tail)), (tail, head)), shape=(n, n)), directed=False)
+    ref = cells[np.isin(group[cells], group[cells[np.unique(piece[cells], return_index=True)[1]]])]
+
+    # latest and earliest optimal potential of every cell, then their midpoint
+    up = csg.dijkstra(G, indices=ref, min_only=True)
+    down = csg.dijkstra(G.T.tocsr(), indices=ref, min_only=True)
+    with np.errstate(invalid="ignore"):
+        return np.where(np.isfinite(up) & np.isfinite(down), p + (up - down) / 2, np.nan)
+
+
+def _normalize_costs(c, cost_range):
+    """Min-max the edge costs into cost_range; a constant-cost graph maps to cost_range[0]."""
+    lo, hi = cost_range
+    if not (np.isfinite([lo, hi]).all() and 0 <= lo <= hi):
+        raise ValueError(f"cost_range must satisfy 0 <= low <= high < inf, got {cost_range!r}.")
+    span = c.max() - c.min()
+    scale = (hi - lo) / (span if span != 0 else 1.0)
+    c = c * scale + (lo - c.min() * scale)
+    _log.detail(f"Costs normalized to [{c.min():.2e}, {c.max():.2e}]")
+    return c
+
+
 @_renamed_kwargs(tag="graph", reconnect_key=("reconnect_graph", _graph_from_key))
-@_log.stage("solving quadratically-regularized transport")
+@_log.stage("solving quadratically regularized transport")
 def qrot(
     graph_result: dict,
     tau: float = 100,
@@ -180,7 +348,6 @@ def qrot(
     reconnect: bool = True,
     reconnect_graph: str = "expr",
     graph: str | None = None,
-    solver_verbose: bool | None = None,
     key_added: str | None = None,
 ) -> None:
     """Transport flow from source to sink cells and read pseudotime off the potentials.
@@ -202,6 +369,12 @@ def qrot(
     the potential rises strictly from sources to sinks. Min-max scaled to ``[0, 1]``,
     p IS the pseudotime.
 
+    The dual is solved directly (SciPy trust region, then Newton steps on the Laplacian of
+    the flow edges) to a Kirchhoff residual of 1e-12 relative to the demand (or its rounding
+    floor). Cells no flow touches, and the offsets between groups of cells the flow joins,
+    are only bounded by ``p_v - p_u <= c_e``; each is placed at the midpoint of its earliest
+    and latest optimal value (two shortest-path searches on the edge slacks).
+
     Parameters
     ----------
     graph_result : dict
@@ -212,11 +385,11 @@ def qrot(
     normalize_costs, cost_range
         Min-max scale edge costs into ``cost_range`` before solving.
     verbose : int or bool, default 1
-        Logging verbosity for DeltaTrace's own output (see ``solver_verbose``).
-    solver_verbose : bool, optional
-        Also forward the cvxpy/CLARABEL iteration log. Off by default.
+        Logging verbosity.
     adata_basis : anndata.AnnData, optional
-        If given, writes ``obs["pseudotime_raw"]`` (before reconnection),
+        If given, writes ``obs["pseudotime_raw"]`` (before reconnection; NaN for cells
+        in graph pieces without a source or sink, which have no potential, and, with
+        one-way edges, for cells bounded on one side only),
         ``obs["pseudotime"]`` (after) and ``uns["dt_flow"]`` (``{"J": (n_edges,),
         "edges": (n_edges, 2)}``).
     adata_clust : anndata.AnnData, optional
@@ -247,8 +420,6 @@ def qrot(
     """
     _sfx = _suffix(key_added)
 
-    import cvxpy as cp
-
     G = graph_result["G"]
     c = graph_result["cost_vec"]
     f = graph_result["f"]
@@ -276,63 +447,33 @@ def qrot(
     assert len(c) == m, f"cost length {len(c)} != edges {m}"
 
     if normalize_costs and m > 0:
-        # Min-max the edge costs into cost_range; a constant-cost graph maps to cost_range[0].
-        _lo, _hi = cost_range
-        _cmin, _cmax = c.min(), c.max()
-        _span = _cmax - _cmin
-        _scale = (_hi - _lo) / (_span if _span != 0 else 1.0)
-        c = c * _scale + (_lo - _cmin * _scale)
-        _log.detail(f"Costs normalized to [{c.min():.2e}, {c.max():.2e}]")
+        c = _normalize_costs(c, cost_range)
 
-    # Incidence matrix B: column e holds -1 at its tail cell u and +1 at its head v.
+    # Edge tails u and heads v (the incidence matrix B of the docstring, kept as index arrays).
     if node_map is None:
         us, vs = E[:, 0], E[:, 1]
     else:
         us = np.array([node_map[u] for u, _ in edges], dtype=np.int64)
         vs = np.array([node_map[v] for _, v in edges], dtype=np.int64)
-    e = np.arange(m)
-    B = sp.csr_matrix(
-        (np.r_[-np.ones(m), np.ones(m)], (np.r_[us, vs], np.r_[e, e])),
-        shape=(n, m),
-    )
 
     f_arr = np.asarray(f, dtype=float)
-    if f_arr.ndim != 1:
-        # Explicit, rather than relying on numpy's element assignment to object: numpy
-        # 1.26 only deprecates assigning a 1-element array into a scalar slot.
+    if f_arr.shape != (n,):
         raise ValueError(
-            f"qrot: demand f must be a 1-D vector, got shape {f_arr.shape}."
+            f"qrot: demand f must be a 1-D vector with one entry per cell ({n}), got "
+            f"shape {f_arr.shape}."
         )
-    f_vec = np.zeros(n, dtype=float)
     if node_map is None:
-        # Element by element, as below, so both kinds of graph take the same path.
-        for i in range(n):
-            f_vec[i] = f_arr[i]
+        f_vec = f_arr.copy()
     else:
+        f_vec = np.zeros(n, dtype=float)
         for v, i in node_map.items():
             f_vec[i] = f_arr[v]
 
-    J = cp.Variable(m, nonneg=True)
-    obj = cp.Minimize(c @ J + (tau / 2) * cp.sum_squares(J))
-    constraints = [f_vec == B @ J]
-    prob = cp.Problem(obj, constraints)
-    _solver_v = bool(solver_verbose)
-    prob.solve(solver=cp.CLARABEL, verbose=_solver_v)
-
-    if prob.status not in ["optimal", "optimal_inaccurate"]:
-        raise RuntimeError(f"QROT did not converge: status={prob.status}")
-    _log.detail(f"solver: CLARABEL, status={prob.status}, objective={prob.value:.6g}")
-
-    J_opt = np.array(J.value).ravel()
-
-    if constraints[0].dual_value is not None:
-        p = -np.array(constraints[0].dual_value).ravel()
-    else:
-        p = np.zeros(n)
+    J_opt, p = _solve_qrot(us, vs, c, f_vec, tau)
 
     _log.detail(f"QROT solved: {m} edges, tau={tau}")
     _log.detail(f"  Flow range: [{J_opt.min():.4e}, {J_opt.max():.4e}]")
-    _log.detail(f"  Potential range: [{p.min():.4e}, {p.max():.4e}]")
+    _log.detail(f"  Potential range: [{np.nanmin(p):.4e}, {np.nanmax(p):.4e}]")
 
     idx_to_name = G.graph["idx_to_name"]
     if node_map is None:
@@ -340,16 +481,17 @@ def qrot(
     else:
         pt_raw = {idx_to_name[node]: p[i] for node, i in node_map.items()}
 
-    # Min-max the potentials onto [0, 1] (pseudotime)
+    # Min-max the potentials onto [0, 1] (pseudotime); cells without one stay NaN
     _vals = np.array(list(pt_raw.values()))
-    _rng = max(_vals.max() - _vals.min(), 1e-12)
-    pt_norm = {k: (v - _vals.min()) / _rng for k, v in pt_raw.items()}
+    _pmin = np.nanmin(_vals)
+    _rng = (np.nanmax(_vals) - _pmin) or 1.0
+    pt_norm = {k: (v - _pmin) / _rng for k, v in pt_raw.items()}
 
     if adata_basis is not None:
-        pt_raw_obs = np.array(
-            [pt_norm.get(str(nm), np.nan) for nm in adata_basis.obs_names], dtype=float
+        obs_names = adata_basis.obs_names.astype(str)
+        adata_basis.obs[f"pseudotime_raw{_sfx}"] = (
+            pd.Series(pt_norm).reindex(obs_names).to_numpy(float)
         )
-        adata_basis.obs[f"pseudotime_raw{_sfx}"] = pt_raw_obs
 
     if reconnect and adata_clust is not None:
         pt_full = _reconnect_pseudotime(
@@ -365,12 +507,9 @@ def qrot(
         pt_full = dict(pt_norm)
 
     if adata_basis is not None:
-        pt_obs = np.array(
-            [pt_full.get(str(nm), np.nan) for nm in adata_basis.obs_names], dtype=float
+        adata_basis.obs[f"pseudotime{_sfx}"] = (
+            pd.Series(pt_full).reindex(obs_names).to_numpy(float)
         )
-        adata_basis.obs[f"pseudotime{_sfx}"] = pt_obs
-
-    if adata_basis is not None:
         if node_map is None:
             # np.array of an empty edge list is shape (0,), not (0, 2): keep that
             edges_arr = E.copy() if m else np.array([], dtype=np.int64)
@@ -382,6 +521,106 @@ def qrot(
         }
 
 
+@_log.stage("solving quadratically regularized transport")
+def qrot_graph(
+    graph,
+    a,
+    b,
+    tau: float = 100,
+    directed: bool = False,
+    normalize_costs: bool = True,
+    verbose: int | bool = 1,
+) -> dict:
+    """QROT on any graph in SciPy's csgraph form: flow, potentials and pseudotime.
+
+    The solver behind :func:`qrot`, without AnnData or :func:`endpoints`. Quadratically regularized
+    optimal transport (QROT) moves the mass ``a`` to ``b`` along the edges: it minimizes
+    ``sum_e c_e J_e + (tau / 2) sum_e J_e ** 2`` over flows ``J >= 0`` whose inflow minus outflow is
+    ``b - a`` at every node. Its dual gives every node a potential ``p``: edge i -> j carries flow only
+    where ``p[j] - p[i] > c_ij``, and then ``flow[i, j] = (p[j] - p[i] - c_ij) / tau``, so ``p`` rises
+    from ``a`` to ``b``.
+
+    Parameters
+    ----------
+    graph : (n, n) scipy sparse array or matrix, numpy array or masked array
+        Edge costs in SciPy's csgraph form: ``graph[i, j]`` is the cost of an edge from i to j. Every
+        stored entry of a sparse graph is an edge, an explicit zero included; in a dense array, 0, inf
+        and NaN are no edge, and so are the masked entries of a masked array. Costs must be finite and
+        nonnegative; self-loops are ignored.
+    a, b : (n,) array_like
+        Source and sink masses, nonnegative. Only ``b - a`` enters the solve, and it must balance on
+        every connected piece of the graph, since no mass crosses between pieces.
+    tau : float, default 100
+        Regularization strength (> 0); larger ``tau`` spreads the flow over more edges. 100 is
+        DeltaTrace's value for costs up to 1 and masses that total 1; for masses that total M, use
+        ``tau / M``.
+    directed : bool, default False
+        ``False`` uses every edge in both directions at the same cost; a pair stored both ways keeps the
+        smaller cost. ``True`` uses each stored entry as a one-way edge, and the edge directions must let
+        the mass reach ``b``.
+    normalize_costs : bool, default True
+        Divide the costs by the largest before solving, so ``tau`` does not depend on their scale; the
+        cheapest paths stay the cheapest. ``False`` solves on the costs as given.
+    verbose : int or bool, default 1
+        Logging verbosity.
+
+    Returns
+    -------
+    dict
+        ``"flow"``: (n, n) scipy.sparse.csr_array, ``flow[i, j]`` the mass sent along i -> j (only edges
+        that carry flow are stored). ``"potential"``: (n,) optimal potentials, in the units of the costs
+        after normalization, with an arbitrary offset per connected piece. Nodes the flow leaves free sit
+        at the midpoint of their optimal range. NaN where the optimum leaves a potential unbounded: every
+        node in a piece without flow and, with ``directed=True``, nodes bounded on one side only.
+        ``"pseudotime"``: the potentials shifted so that every piece starts at 0, then scaled to [0, 1]
+        by the longest piece.
+    """
+    G = graph if sp.issparse(graph) or np.ma.isMaskedArray(graph) else np.asarray(graph, dtype=float)
+    if G.ndim != 2 or G.shape[0] != G.shape[1]:
+        raise ValueError(f"qrot_graph: graph must be square (n, n), got shape {G.shape}.")
+    if not sp.issparse(G):      # SciPy's dense conventions: masked entries, or 0, inf and NaN, are no edge
+        G = csg.csgraph_from_masked(G) if np.ma.isMaskedArray(G) else csg.csgraph_from_dense(G)
+    G = sp.coo_array(sp.csr_array(G))
+    n = G.shape[0]
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    if a.shape != (n,) or b.shape != (n,):
+        raise ValueError(f"qrot_graph: a and b need one entry per node ({n}), got {a.shape} and {b.shape}.")
+    if not (np.isfinite(a).all() and np.isfinite(b).all()) or (a < 0).any() or (b < 0).any():
+        raise ValueError("qrot_graph: a and b must be finite and nonnegative.")
+    if a.sum() <= 0 or not np.isclose(a.sum(), b.sum(), rtol=1e-6, atol=0):
+        raise ValueError(f"qrot_graph: a and b must have the same positive total, got {a.sum()} and {b.sum()}.")
+    b = b * (a.sum() / b.sum())     # equal totals to rounding, as the solver's balance check needs
+
+    # edges: stored entries without self-loops; undirected keeps one cost per pair, used both ways
+    keep = G.row != G.col
+    tail, head, c = G.row[keep].astype(np.int64), G.col[keep].astype(np.int64), G.data[keep].astype(float)
+    if not np.isfinite(c).all() or (c < 0).any():
+        raise ValueError("qrot_graph: edge costs must be finite and nonnegative.")
+    if not directed:
+        u, v = np.minimum(tail, head), np.maximum(tail, head)
+        o = np.lexsort((c, v, u))
+        o = o[np.r_[True, (np.diff(u[o]) != 0) | (np.diff(v[o]) != 0)]] if o.size else o
+        tail, head, c = np.r_[u[o], v[o]], np.r_[v[o], u[o]], np.r_[c[o], c[o]]
+    if c.size == 0:
+        raise ValueError("qrot_graph: the graph has no edges.")
+    if normalize_costs and c.max() > 0:
+        c = c / c.max()
+
+    J, p = _solve_qrot(tail, head, c, b - a, tau)
+    _log.detail(f"QROT solved: {c.size} edges, tau={tau}")
+
+    flow = sp.csr_array((J, (tail, head)), shape=(n, n))
+    flow.eliminate_zeros()
+    # pseudotime: every piece starts at 0 (its offset is arbitrary), one scale for all pieces
+    _, piece = csg.connected_components(sp.coo_array((np.ones(c.size), (tail, head)), shape=(n, n)),
+                                        directed=False)
+    start = np.full(piece.max() + 1, np.inf)
+    np.fmin.at(start, piece, p)
+    pt = p - start[piece]
+    span = np.nanmax(pt) if np.isfinite(pt).any() else 0.0
+    return {"flow": flow, "potential": p, "pseudotime": pt / span if span > 0 else pt}
+
+
 # ---------------------------------------------------------------------------
 # tl.compute_velocity_grid
 # ---------------------------------------------------------------------------
@@ -390,7 +629,7 @@ def compute_velocity_grid(
     adata,
     basis: str = "umap",
     grid_size: tuple = (25, 25),
-    k: int = 10,
+    k: int = 25,
     sigma: float | None = None,
     data_radius_factor: float = 0.7,
     mag_transform: str = "log1p",
@@ -418,7 +657,7 @@ def compute_velocity_grid(
         Embedding name (looked up via ``X_<basis>`` / ``<basis>``).
     grid_size : tuple of int, default (25, 25)
         ``(nx, ny)`` number of grid cells along each axis.
-    k : int, default 10
+    k : int, default 25
         Cells averaged per grid point when smoothing.
     sigma : float, optional
         Gaussian bandwidth; defaults to ``0.8 * hypot`` of grid spacing.
@@ -484,7 +723,10 @@ def compute_velocity_grid(
         net = J - np.asarray(Jmat[v_arr, u_arr]).ravel()  # subtract the reverse-edge flow
         if edge_threshold:
             net = np.where(np.abs(net) > edge_threshold, net, 0.0)
-        np.add.at(node_vec, u_arr, net[:, None] * unit)
+        w = net[:, None] * unit
+        node_vec = np.column_stack(
+            [np.bincount(u_arr, weights=w[:, j], minlength=n) for j in (0, 1)]
+        )
 
     x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
     y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
@@ -501,11 +743,8 @@ def compute_velocity_grid(
     tree = cKDTree(coords)
     grid_pts = np.column_stack([Xg.ravel(), Yg.ravel()])  # (ny*nx, 2)
     k_eff = min(k, n)
-    dists_flat, idxs_flat = tree.query(grid_pts, k=k_eff)  # (ny*nx, k_eff)
-
-    if k_eff == 1:  # tree.query returns 1-D when k=1
-        dists_flat = dists_flat[:, None]
-        idxs_flat = idxs_flat[:, None]
+    # k as a list of ranks keeps the (ny*nx, k_eff) shape even when k_eff == 1
+    dists_flat, idxs_flat = tree.query(grid_pts, k=np.arange(1, k_eff + 1))
 
     # Gaussian-weighted average of the k nearest cells, per grid point
     within_flat = dists_flat[:, 0] <= data_radius_factor * sigma
@@ -661,9 +900,8 @@ def _velocity_basis(adata, basis):
             f"basis=<a finite 2-D obsm embedding>, or compute_velocity=False."
         )
     raise KeyError(
-        "No embedding for the velocity grid: obsm holds neither 'spatial'/'X_spatial' "
-        "nor 'X_umap'. Pass basis=<name of an obsm embedding>, or compute_velocity=False "
-        "to skip the velocity step."
+        "No embedding for the velocity grid (no 'spatial' or 'X_umap' in obsm): pass "
+        "basis=, or compute_velocity=False."
     )
 
 
@@ -720,14 +958,14 @@ def trajectory(
     graph: str | None = None,
     reconnect_graph: str = "expr",
     basis: str | None = None,
-    p_end: float = 0.10,
+    p_end: float = 0.15,
     p_basis: str = "cluster",
     alloc_power: float = 1.0,
     sampling_mode="centered",
     directed_metric: str = "cost",
     tau: float = 100.0,
     seed: int = 42,
-    edge_threshold: float = 1e-6,
+    edge_threshold: float = 0,
     compute_velocity: bool = True,
     omega_term: float | None = None,
     n_lineages: int | None = None,
@@ -742,8 +980,8 @@ def trajectory(
     arguments below; this wrapper only forwards them, and each stays callable on
     its own for when you need to vary one.
 
-    The defaults (``p_end=0.10``, ``p_basis="cluster"``, ``sampling_mode="centered"``,
-    ``tau=100``), with :func:`deltatrace.pp.graphs`' ``alpha=0.3, p_keep=0.32``, are the
+    The defaults (``p_end=0.15``, ``p_basis="cluster"``, ``sampling_mode="centered"``,
+    ``tau=100``), with :func:`deltatrace.pp.graphs`' ``alpha=0.3, p_keep=0.3``, are the
     configuration selected for the intersection graph in the DeltaTrace benchmark
     (scRNA-seq with a paired ST section). The benchmark did not cover single-cell-
     resolution ST.
@@ -834,24 +1072,19 @@ def trajectory(
         tab = terminality(adata, show=False, **rank)
         if len(tab) == 0:
             raise ValueError(
-                "Source-only: no cluster receives flow from another cluster, so there is "
-                "no terminality ranking to choose fates from. Check source_clusters and "
-                "cluster_key, or pass the fates as sink_clusters."
+                "Source-only run: no cluster receives flow from another cluster, so there "
+                "are no fates to rank. Check source_clusters and cluster_key."
             )
-        printed = _log.resolve(verbose) > 0
-        if printed:
+        if _log.resolve(verbose) > 0:
             terminality(adata, show=True, **rank)
-        omega, info = suggest_omega(tab["Term"].to_numpy())
-        picked = [str(c) for c in tab.index[tab["Term"] >= omega]]
+        omega, _ = suggest_omega(tab["term_score"].to_numpy())
+        picked = [str(c) for c in tab.index[tab["term_score"] >= omega]]
+        call = (f"dt.tl.lineages(adata=adata, source_clusters={[str(c) for c in source_clusters]}"
+                + (f", cluster_key={cluster_key!r}" if cluster_key != "clusters" else "")
+                + f", n_lineages={len(picked)}" + (f", key_added={key_added!r}" if key_added else "") + ")")
         warnings.warn(
-            "Source-only run: pseudotime and flow are computed, but no lineages were "
-            "assigned, because no terminal fates were chosen. The terminality ranking "
-            f"({'printed; ' if printed else ''}result['terminality']) suggests {picked}"
-            + (" (a clear gap)" if info["clear"] else " (no clear gap)")
-            + ". Run again with the fates you choose as sink_clusters=[...] (recommended: "
-            "sinks give the better trajectory), or assign lineages on this flow with "
-            "dt.tl.lineages(adata, source_clusters, n_lineages=k"
-            + (f", key_added={key_added!r}" if key_added else "") + ").",
+            f"Source-only run: no lineages assigned. Rerun with sink_clusters={picked}, or call {call} "
+            "on this flow.",
             UserWarning,
             skip_file_prefixes=(_PKG_DIR,),
         )

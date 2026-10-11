@@ -427,20 +427,15 @@ def test_largest_and_smallest_move_monotonically_with_alloc_power(clamp_object):
 @pytest.mark.parametrize("bad", [-0.1, 1.0001, 2, 10.0, -1, float("nan"), float("inf"),
                                  float("-inf")])
 def test_alloc_power_outside_the_unit_range_raises(pool_object, bad):
-    """Only [0, 1] is meaningful, and the message must name the range and both ends.
-
-    Both ends of the range, and both ways of leaving it: a caller who typed a negative
-    exponent to protect small strata even harder must not be told only about large clusters.
-    """
+    """Only [0, 1] is meaningful; the message names the range and what its ends mean."""
     with pytest.raises(ValueError) as e:
         dt.tl.endpoints(pool_object, pool_object, ["A", "B"], ["C"], cluster_key="clusters",
                         graph="intr", p_end=0.10, verbose=0, p_basis="cluster",
                         alloc_power=bad)
     msg = str(e.value)
     assert "alloc_power" in msg
-    assert "[0.0, 1.0]" in msg, msg
+    assert "[0, 1]" in msg, msg
     assert "equal" in msg and "proportional" in msg, msg
-    assert "below 0.0" in msg and "above 1.0" in msg, msg
 
 
 @pytest.mark.parametrize("bad", ["0.5", "half", None, [0.5], {"A": 0.5}, True, False])

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 import warnings
 from collections.abc import Mapping
+from itertools import pairwise
 
 import anndata as ad
 import numpy as np
@@ -20,58 +19,38 @@ from ._utils import _MODE_GRAPHS, _PKG_DIR, _is_positional_index, _renamed_kwarg
 # ---------------------------------------------------------------------------
 # pp.wasserstein  (consumes a cell-to-spot mapping matrix, e.g. from Tangram)
 # ---------------------------------------------------------------------------
-def _pair_emd(idx_i, w_i, idx_j, w_j, D, max_dist):
-    """EMD between cell i's and cell j's spot distributions, rescaled from the
-    [0, 1] ground metric back to microns. Returns (finite, distance); distance
-    is 0.0 and meaningless when finite is False. Shared kernel for wasserstein's
-    serial loop and _compute_row_pairs, so the two paths can't drift apart."""
+def _emd_rows(rows, nbrs_arr, nbr_lens, weights_arr, coords):
+    """EMDs from each cell in rows to every later cell (condensed order, nan if undefined)."""
     import ot
 
-    emd = ot.emd2(w_i, w_j, D[np.ix_(idx_i, idx_j)])
-    finite = bool(np.isfinite(emd))
-    return finite, float(emd * max_dist) if finite else 0.0
-
-
-def _compute_row_pairs(
-    i: int,
-    nbrs_arr: np.ndarray,
-    nbr_lens: np.ndarray,
-    weights_arr: np.ndarray,
-    D: np.ndarray,
-    max_dist: float,
-) -> tuple:
-    """Worker for wasserstein's parallel path: EMD from cell i to every cell j > i,
-    against the padded per-cell spot index/weight arrays. Returns (is, js, ds,
-    n_dropped), the last being pairs whose EMD came back non-finite."""
-    k_i = int(nbr_lens[i])
-    if k_i == 0:
-        return np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.float32), 0
-    idx_i = nbrs_arr[i, :k_i]
-    w_i = weights_arr[i, :k_i]
     n_cells = len(nbr_lens)
-    buf_i, buf_j, buf_d = [], [], []
-    n_dropped = 0
-    for j in range(i + 1, n_cells):
-        k_j = int(nbr_lens[j])
-        if k_j == 0:
-            continue
-        idx_j = nbrs_arr[j, :k_j]
-        w_j = weights_arr[j, :k_j]
-        finite, d = _pair_emd(idx_i, w_i, idx_j, w_j, D, max_dist)
-        if not finite:
-            n_dropped += 1
-            continue
-        buf_i.append(i)
-        buf_j.append(j)
-        buf_d.append(d)
-    if not buf_d:
-        return np.empty(0, np.int32), np.empty(0, np.int32), np.empty(0, np.float32), n_dropped
-    return (
-        np.array(buf_i, dtype=np.int32),
-        np.array(buf_j, dtype=np.int32),
-        np.array(buf_d, dtype=np.float32),
-        n_dropped,
-    )
+    out = []
+    n_dropped = n_unconverged = 0
+    with warnings.catch_warnings():
+        # convergence is read from POT's result code, so its per-pair warning is noise
+        warnings.filterwarnings("ignore", "numItermax reached", UserWarning)
+        for i in rows:
+            d = np.full(n_cells - i - 1, np.nan)
+            out.append(d)
+            idx_i, w_i = nbrs_arr[i, :nbr_lens[i]], weights_arr[i, :nbr_lens[i]]
+            if w_i.size == 0:
+                continue
+            for j in range(i + 1, n_cells):
+                k_j = nbr_lens[j]
+                if k_j == 0:
+                    continue
+                cost = cdist(coords[idx_i], coords[nbrs_arr[j, :k_j]])
+                emd, log = ot.emd2(w_i, weights_arr[j, :k_j], cost, log=True)
+                # the network simplex can land a hair below 0 for near-identical distributions
+                emd = np.maximum(emd, 0)
+                if not np.isfinite(emd):
+                    n_dropped += 1
+                # POT's MAX_ITER_REACHED: an early-stopped plan can miss the marginals, bounding nothing
+                elif log["result_code"] == 3:
+                    n_unconverged += 1
+                else:
+                    d[j - i - 1] = emd
+    return np.concatenate(out), n_dropped, n_unconverged
 
 
 @_log.stage("computing cell-cell Wasserstein distances")
@@ -92,8 +71,11 @@ def wasserstein(
         s.t.                     P 1 = a,  P^T 1 = b
 
     Only the top ``mass_threshold`` fraction of each cell's mass is kept, which is
-    what keeps the all-pairs cost tractable. Pairs whose EMD comes back non-finite
-    are dropped and reported once as a ``RuntimeWarning``.
+    what keeps the all-pairs cost tractable. Cells with the same distribution are at
+    distance 0, which :func:`integrate` keeps as the closest pair. Pairs whose EMD comes
+    back non-finite, or that hit the solver's iteration cap, are left undefined (NaN) and
+    counted in one ``RuntimeWarning``. A mapping whose median cell keeps over half of all
+    spots is warned about as nearly uniform.
 
     Parameters
     ----------
@@ -112,19 +94,23 @@ def wasserstein(
     verbose : int or bool, default 1
         Logging verbosity (0 silent, 2 most detailed).
     n_jobs : int, default -1
-        Joblib workers; ``-1`` uses all cores. Every cell pair is solved, so this is
-        the step that grows fastest with the number of cells. ``1`` runs serially in
-        this process (float64 weights; the parallel path holds them as float32, so the
-        two agree to float32 precision, relative ~1e-7). Starting the workers costs about
-        a second, and joblib falls back to one process where it cannot spawn any.
+        Joblib workers; ``-1`` uses all cores, ``1`` runs in this process. Every cell
+        pair is solved, so this is the step that grows fastest with the number of cells.
+        The result does not depend on it. Starting the workers costs about a second,
+        and joblib falls back to one process where it cannot spawn any.
 
     Returns
     -------
     anndata.AnnData
-        Symmetric ``(n_cells, n_cells)`` sparse distance matrix (microns), indexed
-        by ``M``'s cell names, for :func:`integrate` / :func:`graphs`.
+        Indexed by ``M``'s cell names, with no variables;
+        ``uns["distances"]`` holds every pairwise distance (microns) once, as a
+        float64 vector in SciPy's condensed ``pdist`` order
+        (``scipy.spatial.distance.squareform`` gives the square matrix). That is
+        ``4 n_cells^2`` bytes, half a dense matrix. :func:`integrate` /
+        :func:`graphs` read it as ``adata_dist``.
     """
     import scanpy as sc
+    from joblib import Parallel, delayed, effective_n_jobs
 
     if isinstance(M, str):
         M = sc.read_h5ad(M)
@@ -132,16 +118,14 @@ def wasserstein(
     # --- validate the mapping-side inputs ---------------------------------------
     if "spatial" not in adata_sp.obsm:
         raise KeyError(
-            "adata_sp.obsm['spatial'] not found. The Wasserstein ground metric "
-            "is built from the spatial spot coordinates of the reference used to "
-            "produce the mapping M. Set adata_sp.obsm['spatial'] (shape "
-            "(n_spots, 2)) before calling wasserstein()."
+            "adata_sp.obsm['spatial'] not found: set it to the spot coordinates, "
+            "shape (n_spots, 2)."
         )
     n_spots = adata_sp.n_obs
     if M.shape[1] != n_spots:
         raise ValueError(
-            f"Mapping matrix M has {M.shape[1]} spot columns but adata_sp has "
-            f"{n_spots} spots. M.X must be (n_cells, n_spots) aligned to adata_sp."
+            f"M has {M.shape[1]} spot columns but adata_sp has {n_spots} spots; "
+            "M.X must be (n_cells, n_spots)."
         )
 
     coords = np.asarray(adata_sp.obsm["spatial"])
@@ -153,26 +137,20 @@ def wasserstein(
             and not _is_positional_index(sp_spots)):
         if len(set(sp_spots)) != len(sp_spots) or len(set(m_spots)) != len(m_spots):
             raise ValueError(
-                "M.var_names or adata_sp.obs_names repeats a spot name, so the mapping's "
-                "columns cannot be matched to the spots by name. De-duplicate the names."
+                "M.var_names or adata_sp.obs_names repeats a spot name: make the names "
+                "unique."
             )
         if set(m_spots) != set(sp_spots):
             raise ValueError(
-                "M's spot columns (var_names) and adata_sp's spots (obs_names) name "
-                f"different spots, e.g. {sorted(set(m_spots) - set(sp_spots))[:3]} vs "
+                "M.var_names and adata_sp.obs_names name different spots, e.g. "
+                f"{sorted(set(m_spots) - set(sp_spots))[:3]} vs "
                 f"{sorted(set(sp_spots) - set(m_spots))[:3]}. Pass the spatial object the "
-                "mapping was made on. If the two only label the same spots differently and "
-                "are already in the same order, give M a default 0, 1, 2, ... var index to "
-                "keep the positional reading."
+                "mapping was made on, or give M a default 0, 1, 2, ... var index to match "
+                "by position."
             )
-        pos = {nm: i for i, nm in enumerate(sp_spots)}
-        coords = coords[[pos[nm] for nm in m_spots]]
+        coords = coords[pd.Index(sp_spots).get_indexer(m_spots)]
         _log.detail("Matched M's spot columns to adata_sp's spots by name")
-    coords = coords * pxl_to_um
-    D_um = cdist(coords, coords, metric="euclidean")
-    max_dist = float(np.max(D_um))
-    D_scaled = (D_um / max_dist).astype(np.float32)
-    del D_um
+    coords = np.asarray(coords * pxl_to_um, dtype=np.float64)
 
     X = M.X
     if sp.issparse(X):
@@ -184,8 +162,9 @@ def wasserstein(
 
     for i in range(X.shape[0]):
         if sp.issparse(X):
-            indices = X[i].indices
-            w = X[i].data
+            row = slice(X.indptr[i], X.indptr[i + 1])
+            indices = X.indices[row]
+            w = X.data[row]
         else:
             indices = np.flatnonzero(X[i])
             w = X[i, indices]
@@ -212,342 +191,327 @@ def wasserstein(
 
     n_cells = len(nbrs)
     total_pairs = n_cells * (n_cells - 1) // 2
+    nbr_lens = np.array([len(x) for x in nbrs], dtype=np.int64)
+    if n_cells and np.median(nbr_lens) > n_spots / 2:
+        warnings.warn(
+            "Mapping nearly uniform; consider a different mapping (a better-matched dataset "
+            "or algorithm).",
+            UserWarning,
+            skip_file_prefixes=(_PKG_DIR,),
+        )
 
     if _log.wants_detail():
-        n_spots_per_cell = [len(idx) for idx in nbrs]
         _log.detail(
             f"{mass_threshold * 100:.0f}% mass-threshold spots per cell: "
-            f"min {np.min(n_spots_per_cell)}, mean {np.mean(n_spots_per_cell):.1f}, "
-            f"median {np.median(n_spots_per_cell):.0f}, max {np.max(n_spots_per_cell)}"
+            f"min {np.min(nbr_lens)}, mean {np.mean(nbr_lens):.1f}, "
+            f"median {np.median(nbr_lens):.0f}, max {np.max(nbr_lens)}"
         )
     _log.detail(f"{n_cells} cells, {total_pairs} pairs (n_jobs={n_jobs})")
 
-    # Pre-allocate output arrays
-    ci = np.empty(total_pairs, dtype=np.int32)
-    cj = np.empty(total_pairs, dtype=np.int32)
-    dists = np.empty(total_pairs, dtype=np.float32)
-    ptr = 0
-    n_dropped = 0
+    # padded per-cell spot arrays, which joblib memmaps for the workers
+    max_k = int(nbr_lens.max()) if n_cells > 0 else 0
+    nbrs_arr = np.zeros((n_cells, max_k), dtype=np.int64)
+    weights_arr = np.zeros((n_cells, max_k), dtype=np.float64)
+    for i, (idx, w) in enumerate(zip(nbrs, weights, strict=True)):
+        nbrs_arr[i, : len(idx)] = idx
+        weights_arr[i, : len(w)] = w
 
-    if n_jobs == 1:
-        for i in range(n_cells):
-            if i % 100 == 0:
-                _log.detail(f"processing cell {i}/{n_cells}")
-            idx_i = nbrs[i]
-            w_i = weights[i]
-            if w_i.size == 0:
-                continue
-            for j in range(i + 1, n_cells):
-                idx_j = nbrs[j]
-                w_j = weights[j]
-                if w_j.size == 0:
-                    continue
-                finite, d = _pair_emd(idx_i, w_i, idx_j, w_j, D_scaled, max_dist)
-                if finite:
-                    dists[ptr] = d
-                    ci[ptr] = i
-                    cj[ptr] = j
-                    ptr += 1
-                else:
-                    n_dropped += 1
-    else:
-        import joblib
-        from joblib import Parallel, delayed
+    # blocks of consecutive rows holding about the same number of pairs
+    pairs_before = np.r_[0, np.cumsum(np.arange(n_cells - 1, 0, -1))]
+    n_blocks = 8 * effective_n_jobs(n_jobs)
+    cuts = np.unique(np.searchsorted(pairs_before, np.linspace(0, total_pairs, n_blocks + 1)))
+    blocks = [range(a, b) for a, b in pairwise(cuts)]
 
-        nbr_lens = np.array([len(x) for x in nbrs], dtype=np.int32)
-        max_k = int(nbr_lens.max()) if n_cells > 0 else 0
-        nbrs_arr = np.full((n_cells, max_k), -1, dtype=np.int32)
-        weights_arr = np.zeros((n_cells, max_k), dtype=np.float32)
-        for i, (idx, w) in enumerate(zip(nbrs, weights, strict=True)):
-            nbrs_arr[i, : len(idx)] = idx
-            weights_arr[i, : len(w)] = w
+    # fill one preallocated condensed vector as the blocks finish
+    distances = np.empty(total_pairs)
+    n_dropped = n_unconverged = 0
+    gen = Parallel(n_jobs=n_jobs, backend="loky", return_as="generator")(
+        delayed(_emd_rows)(rows, nbrs_arr, nbr_lens, weights_arr, coords) for rows in blocks
+    )
+    for rows, (d, rdrop, runconv) in zip(blocks, gen, strict=True):
+        distances[pairs_before[rows[0]]:pairs_before[rows[0]] + d.size] = d
+        n_dropped += rdrop
+        n_unconverged += runconv
+        _log.detail(f"processed cells up to {rows[-1] + 1}/{n_cells}")
 
-        with tempfile.NamedTemporaryFile(suffix=".mmap", delete=False) as f:
-            mmap_path = f.name
-        try:
-            joblib.dump((nbrs_arr, nbr_lens, weights_arr, D_scaled), mmap_path)
-            nbrs_s, lens_s, weights_s, D_s = joblib.load(mmap_path, mmap_mode="r")
-
-            gen = Parallel(n_jobs=n_jobs, backend="loky", return_as="generator")(
-                delayed(_compute_row_pairs)(i, nbrs_s, lens_s, weights_s, D_s, max_dist)
-                for i in range(n_cells)
-            )
-            for ri, rj, rd, rdrop in gen:
-                n_dropped += rdrop
-                n = len(rd)
-                if n > 0:
-                    ci[ptr : ptr + n] = ri
-                    cj[ptr : ptr + n] = rj
-                    dists[ptr : ptr + n] = rd
-                    ptr += n
-        finally:
-            os.unlink(mmap_path)
-
+    notes = []
     if n_dropped:
-        warnings.warn(
-            f"{n_dropped} of {total_pairs} cell pairs had a non-finite EMD and were "
-            f"dropped from the Wasserstein graph (usually degenerate/empty spot "
-            f"distributions). Their edges are simply absent.",
-            RuntimeWarning,
-            stacklevel=2,
+        notes.append(
+            f"{n_dropped} of {total_pairs} cell pairs had a non-finite EMD (often an "
+            "empty spot distribution) and get no edge."
         )
-
-    ci = ci[:ptr]
-    cj = cj[:ptr]
-    dists = dists[:ptr]
+    if n_unconverged:
+        notes.append(
+            f"{n_unconverged} of {total_pairs} cell pairs hit the EMD iteration cap and were "
+            f"left undefined (NaN)."
+        )
+    if notes:
+        warnings.warn(" ".join(notes), RuntimeWarning, skip_file_prefixes=(_PKG_DIR,))
 
     if _log.wants_detail():
-        n_valid = len(dists)
+        valid = distances[np.isfinite(distances)]
         _log.detail(
-            f"valid pairs: {n_valid}/{total_pairs} "
-            f"({100 * n_valid / total_pairs:.2f}%)"
+            f"valid pairs: {valid.size}/{total_pairs} "
+            f"({100 * valid.size / total_pairs:.2f}%)"
         )
-        if n_valid > 0:
+        if valid.size > 0:
             _log.detail(
-                f"distance (microns): min {dists.min():.4g}, mean {dists.mean():.4g}, "
-                f"median {np.median(dists):.4g}, max {dists.max():.4g}"
+                f"distance (microns): min {valid.min():.4g}, mean {valid.mean():.4g}, "
+                f"median {np.median(valid):.4g}, max {valid.max():.4g}"
             )
 
-    # Build symmetric sparse distance matrix (microns)
-    wd_upper = sp.coo_matrix(
-        (dists, (ci, cj)), shape=(n_cells, n_cells), dtype=np.float32
+    return ad.AnnData(
+        obs=pd.DataFrame(index=M.obs_names),
+        uns={
+            "distances": distances,
+            "d_max": float(np.fmax.reduce(distances, initial=0.0)),
+            "mass_threshold": mass_threshold,
+            "cost": "euclidean",
+        },
     )
-    wd_sparse = (wd_upper + wd_upper.T).tocsr()
-    d_max = wd_sparse.data.max() if wd_sparse.data.size else 0.0
-
-    cell_names = M.obs_names
-    adata_wd = ad.AnnData(
-        X=wd_sparse,
-        obs=pd.DataFrame(index=cell_names),
-        var=pd.DataFrame(index=cell_names),
-    )
-    adata_wd.uns["d_max"] = float(d_max)
-    adata_wd.uns["mass_threshold"] = mass_threshold
-    adata_wd.uns["cost"] = "euclidean"
-
-    return adata_wd
 
 
 # Per-dataset quantile of -ln(conn) clipping transport costs. No public knob: retune here.
 _COST_CAP_QUANTILE = 0.99
 
 
-def _align_distance_matrix(names_sc, names_dist, ext_dist):
-    """Permute `ext_dist` into adata_sc's row order, matched against adata_dist's
-    names (positional index on either side is read as "no identity", not compared).
-    Raises ValueError on unresolvable mismatches or duplicate names.
-
-    integrate() fuses ext_dist with the expression graph position by position, so a
-    mismatch here would silently fuse the wrong cells rather than error.
-    """
-    from collections import Counter
-
+def _align_distance_matrix(names_sc, names_dist):
+    """Each adata_sc cell's position in adata_dist by name, or None to read in order."""
     sc_names = [str(nm) for nm in names_sc]
     d_names = [str(nm) for nm in names_dist]
     if sc_names == d_names:
-        return ext_dist
+        return None
     if _is_positional_index(d_names):
         if not _is_positional_index(sc_names):
             warnings.warn(
-                "adata_dist has no cell names (a default 0, 1, 2, ... index), so its rows "
-                "are taken to follow adata's cell order, unchecked. Give it adata's cell "
-                "names, e.g. ad.AnnData(X=D, obs=pd.DataFrame(index=adata.obs_names)), "
-                "and it is matched to the cells by name instead.",
+                "adata_dist has no cell names, so its rows are read in adata's cell "
+                "order. Give it adata's obs_names to match the cells by name.",
                 UserWarning,
                 skip_file_prefixes=(_PKG_DIR,),
             )
-        return ext_dist
+        return None
     if _is_positional_index(sc_names) and set(sc_names) != set(d_names):
-        return ext_dist
+        return None
 
     for who, names in (("adata_dist", d_names), ("adata_sc", sc_names)):
-        counts = Counter(names)
-        dupes = sorted(nm for nm, k in counts.items() if k > 1)[:3]
+        idx = pd.Index(names)
+        dupes = sorted(idx[idx.duplicated()].unique())[:3]
         if dupes:
             raise ValueError(
-                f"{who}.obs_names repeats {dupes}, so the rows of adata_dist cannot be "
-                "matched to adata_sc unambiguously. De-duplicate the names (see "
-                "AnnData.obs_names_make_unique), or pass a distance object already in "
-                "adata_sc's row order with a default index."
+                f"{who}.obs_names repeats {dupes}: make the names unique "
+                "(AnnData.obs_names_make_unique)."
             )
 
-    d_pos = {nm: i for i, nm in enumerate(d_names)}
-    missing = [nm for nm in sc_names if nm not in d_pos]
-    if missing:
-        sc_set = set(sc_names)
-        extra = [nm for nm in d_names if nm not in sc_set]
+    d_idx = pd.Index(d_names)
+    perm = d_idx.get_indexer(sc_names)
+    if (perm < 0).any():
+        missing = pd.Index(sc_names)[perm < 0].tolist()
         raise ValueError(
-            f"adata_sc and adata_dist name different cells: {len(missing)} of "
-            f"adata_sc.obs_names are absent from adata_dist, e.g. {missing[:3]}"
-            + (f"; adata_dist has e.g. {extra[:3]} instead" if extra else "")
-            + ". They must describe the same cells. If the two objects simply label the "
-            "same cells differently and adata_dist is already in adata_sc's row order, "
-            "pass it with a default 0, 1, 2, ... index to keep the positional reading."
+            f"adata_sc and adata_dist name different cells: {len(missing)} of adata_sc's "
+            f"are missing from adata_dist, e.g. {missing[:3]}. If they are the same cells "
+            "in the same order, give adata_dist a default 0, 1, 2, ... index."
         )
 
-    perm = np.array([d_pos[nm] for nm in sc_names], dtype=np.int64)
     n_moved = int((perm != np.arange(perm.size)).sum())
     _log.detail(
         f"Realigned adata_dist to adata_sc.obs_names ({n_moved} of {perm.size} rows moved)"
     )
-    return ext_dist[perm][:, perm].tocsr()
+    return perm
+
+
+def _square_to_condensed(D):
+    """Condensed form of a square distance matrix (NaN where a sparse one stores nothing), checked and max-symmetrized a block of rows at a time."""
+    n = D.shape[0]
+    D = D.tocsr() if sp.issparse(D) else D
+    dc = np.empty(n * (n - 1) // 2)
+    row_start = np.r_[0, np.cumsum(np.arange(n - 1, 0, -1))]
+    n_nonzero = n_bad = n_neg = n_diag = n_asym = 0
+    step = max(1, 2**22 // max(n, 1))
+    for s in range(0, n, step):
+        B = D[s:s + step]
+        if sp.issparse(B):
+            # a stored entry is a distance (0 included), an absent one is not
+            B = B.tocoo()
+            B.sum_duplicates()
+            vals = B.data.astype(np.float64)
+            rows, cols, B = B.row, B.col, np.full(B.shape, np.nan)
+            B[rows, cols] = vals
+        else:
+            B = vals = np.asarray(B, dtype=np.float64)
+        n_nonzero += np.count_nonzero(vals)
+        n_bad += np.count_nonzero(~np.isfinite(vals))
+        n_neg += np.count_nonzero(vals < 0)
+        for r, row in enumerate(B, start=s):
+            # upper triangle in place, lower triangle merged by max (undirected prior)
+            n_diag += row[r] > 0
+            dc[row_start[r]:row_start[r] + n - r - 1] = row[r + 1:]
+            pos = row_start[:r] + r - np.arange(r) - 1
+            same = (dc[pos] == row[:r]) | (np.isnan(dc[pos]) & np.isnan(row[:r]))
+            n_asym += 2 * np.count_nonzero(~same)
+            dc[pos] = np.fmax(dc[pos], row[:r])
+
+    if not n_nonzero:
+        raise ValueError("Distance matrix has no nonzero entries.")
+    # a non-finite entry is a bad input, not a missing distance
+    if n_bad:
+        raise ValueError(
+            f"Distance matrix has {n_bad} non-finite entries (NaN or inf); leave unknown "
+            "pairs out of a sparse matrix instead."
+        )
+    if n_neg:
+        raise ValueError(
+            f"Distance matrix has {n_neg} negative entries; distances must be >= 0."
+        )
+    # a cell's distance to itself is never an edge
+    if n_diag:
+        _log.detail(f"Dropping {n_diag} stored diagonal entries")
+        if n_nonzero == n_diag:
+            raise ValueError("Distance matrix has no off-diagonal nonzero entries.")
+    if n_asym:
+        _log.detail(f"Symmetrizing distance matrix ({n_asym} asymmetric entries)")
+    return dc
+
+
+def _pair_index(n, i, j):
+    """Position of pair (i, j), i < j, in scipy's condensed (pdist) order."""
+    return n * i - i * (i + 1) // 2 + j - i - 1
+
+
+def _keep_threshold(dc, p_keep):
+    """(threshold, d_max, n distances, n kept, max) of dc's finite d >= 0; the quantile counts each pair twice, as the square matrix does."""
+    if not 0 <= p_keep <= 1:
+        raise ValueError("Quantiles must be in the range [0, 1]")
+    chunk, n_bins = 1 << 24, 1 << 16
+
+    def distance_chunks():
+        for s in range(0, dc.size, chunk):
+            v = dc[s:s + chunk]
+            yield v[(v >= 0) & np.isfinite(v)]
+
+    # largest distance and a histogram of all distances (no copy of dc)
+    top = max((v.max() for v in distance_chunks() if v.size), default=0.0)
+    if top == 0:
+        raise ValueError("Distance matrix has no nonzero entries.")
+
+    def bin_of(v):
+        return np.minimum((v / top * n_bins).astype(np.int64), n_bins - 1)
+
+    counts = sum(np.bincount(bin_of(v), minlength=n_bins) for v in distance_chunks())
+    n_dist = int(counts.sum())
+
+    # np.quantile over the square matrix's 2 n_dist values interpolates between two order statistics
+    n_square = 2 * n_dist
+    position = (n_square - 1) * float(p_keep)
+    below = int(position)
+    ranks = np.array([below, min(below + 1, n_square - 1)]) // 2
+
+    # read those two values exactly: sort only the histogram bins that hold them
+    cum_counts = np.cumsum(counts)
+    rank_bins = np.searchsorted(cum_counts, ranks, side="right")
+    first_rank = cum_counts - counts
+    candidates = np.sort(np.concatenate([v[np.isin(bin_of(v), rank_bins)] for v in distance_chunks()]))
+    a, b = candidates[ranks - first_rank[rank_bins[0]]]
+    threshold = np.quantile([a, b], position - below)
+
+    # kept distances: at most the threshold
+    n_kept, d_max = 0, 0.0
+    for v in distance_chunks():
+        v = v[v <= threshold]
+        if v.size:
+            n_kept, d_max = n_kept + v.size, max(d_max, v.max())
+    return threshold, d_max, n_dist, n_kept, top
 
 
 def _blend_with_distances(adata, adata_dist, expr_conn, alpha, p_keep, mode):
-    """The spatial half of :func:`integrate`: align and filter the distance matrix, then
-    blend it with the expression connectivities. Returns the integrated connectivity
-    matrix and the entries integrate() records about it in ``uns[...]["params"]``."""
+    """The spatial half of :func:`integrate`: blended connectivities and their params."""
     n_cells = expr_conn.shape[0]
 
-    # Extract and filter distance matrix
-    ext_dist = adata_dist.X.copy()
-    if ext_dist.dtype != np.float64:
-        ext_dist = ext_dist.astype(np.float64)
-    if not sp.issparse(ext_dist):
-        ext_dist = sp.csr_matrix(ext_dist)
-    ext_dist = ext_dist.tocsr()
-
-    if ext_dist.shape[0] != n_cells:
+    # condensed vector, or a square matrix to condense once the names are checked
+    if isinstance(adata_dist, pd.DataFrame):
+        if not adata_dist.index.equals(adata_dist.columns):
+            raise ValueError(
+                "adata_dist's row and column labels must name the same cells in the "
+                "same order."
+            )
+        names, D = adata_dist.index, adata_dist.to_numpy()
+    elif "distances" in adata_dist.uns:
+        names, D = adata_dist.obs_names, np.asarray(adata_dist.uns["distances"])
+    else:
+        names, D = adata_dist.obs_names, adata_dist.X
+    n_dist = len(names) if D.ndim == 1 else D.shape[0]
+    if n_dist != n_cells:
+        raise ValueError(f"Cell count mismatch: sc={n_cells}, dist={n_dist}")
+    if D.ndim == 1 and D.size != n_cells * (n_cells - 1) // 2:
         raise ValueError(
-            f"Cell count mismatch: sc={n_cells}, dist={ext_dist.shape[0]}"
+            f"adata_dist.uns['distances'] holds {D.size} distances; {n_cells} cells "
+            f"have {n_cells * (n_cells - 1) // 2} pairs."
         )
-    if ext_dist.shape[1] != n_cells:
+    if D.ndim == 2 and D.shape[1] != n_cells:
         raise ValueError(
-            f"Distance matrix must be square over the cells: got {ext_dist.shape[0]}x"
-            f"{ext_dist.shape[1]} for {n_cells} cells."
+            f"Distance matrix must be square over the cells: got {D.shape[0]}x"
+            f"{D.shape[1]} for {n_cells} cells."
         )
-    ext_dist = _align_distance_matrix(adata.obs_names, adata_dist.obs_names, ext_dist)
-    if ext_dist.data.size == 0:
-        raise ValueError("Distance matrix has no nonzero entries.")
+    perm = _align_distance_matrix(adata.obs_names, names)
+    dc = D if D.ndim == 1 else _square_to_condensed(D)
 
-    # A non-finite entry does not raise anywhere downstream: np.quantile returns nan, the
-    # `> threshold` comparison is then False everywhere so nothing is filtered, ext_dist_max
-    # is nan, and EVERY stored value of both output matrices comes out nan. Catch it here,
-    # where the caller can still tell which matrix was bad.
-    if not np.isfinite(ext_dist.data).all():
-        n_bad = int((~np.isfinite(ext_dist.data)).sum())
-        raise ValueError(
-            f"Distance matrix has {n_bad} non-finite entries (NaN or inf). These do not "
-            "raise downstream -- they propagate silently into every edge of the integrated "
-            "graph. Common source: arccos of a dot product that floating point pushed just "
-            "past 1.0. Clip the input before calling integrate()."
-        )
-    if (ext_dist.data < 0).any():
-        raise ValueError(
-            f"Distance matrix has {int((ext_dist.data < 0).sum())} negative entries. "
-            "integrate() maps distance to similarity as 1 - d/d_max, which is only "
-            "meaningful for d >= 0."
-        )
-
-    # The p_keep quantile runs over the STORED values, so a stored diagonal is counted as
-    # n zero-distances and drags the threshold down -- silently retuning p_keep by an amount
-    # that depends on how dense the caller's matrix is. A cell's distance to itself is never
-    # an edge, so drop it before the quantile rather than after.
-    if ext_dist.diagonal().any():
-        _log.detail(f"Dropping {int((ext_dist.diagonal() != 0).sum())} stored diagonal entries")
-        ext_dist = ext_dist.tolil()
-        ext_dist.setdiag(0)
-        ext_dist = ext_dist.tocsr()
-        ext_dist.eliminate_zeros()
-        if ext_dist.data.size == 0:
-            raise ValueError("Distance matrix has no off-diagonal nonzero entries.")
-
-    # The graph the prior defines is undirected, but nothing below symmetrizes the SUPPORT:
-    # the intersection mask, and hence which edges survive, would otherwise depend on which
-    # triangle the caller happened to fill in. (`maximum` is a no-op on an already-symmetric
-    # matrix, so this cannot change a well-formed input.)
-    _asym = abs(ext_dist - ext_dist.T)
-    _asym.eliminate_zeros()
-    if _asym.nnz:
-        _log.detail(f"Symmetrizing distance matrix ({_asym.nnz} asymmetric entries)")
-        ext_dist = ext_dist.maximum(ext_dist.T).tocsr()
-
-    ext_dist_unfiltered_max = float(ext_dist.data.max())
-    threshold = np.quantile(ext_dist.data, p_keep)
-
-    ext_dist_filt = ext_dist.copy()
-    ext_dist_filt.data[ext_dist_filt.data > threshold] = 0
-    ext_dist_filt.eliminate_zeros()
-
+    threshold, d_max, n_pos, n_kept, d_top = _keep_threshold(dc, p_keep)
     _log.detail(
-        f"Distance filtering: kept {ext_dist_filt.nnz} / {ext_dist.nnz} edges "
+        f"Distance filtering: kept {2 * n_kept} / {2 * n_pos} edges "
         f"(p_keep={p_keep}, threshold={threshold:.4g})"
     )
-
-    # Normalize to [0, 1]
     expr_conn_max = expr_conn.data.max()
-    ext_dist_max = ext_dist_filt.data.max()
-
-    expr_c_n = expr_conn.copy()
-    expr_c_n.data = expr_c_n.data / expr_conn_max
-    ext_d_n = ext_dist_filt.copy()
-    ext_d_n.data = ext_d_n.data / ext_dist_max
-    ext_c_n = ext_d_n.copy()
-    ext_c_n.data = 1.0 - ext_c_n.data  # similarity = 1 - dist
-
     _log.detail(
         f"Normalization - expr_conn_max: {expr_conn_max:.4g}, "
-        f"ext_dist_max: {ext_dist_max:.4g}"
+        f"ext_dist_max: {d_max:.4g}"
     )
 
-    # kNN side = connectivities only -> mask from the symmetric connectivity support
-    expr_mask = expr_c_n.copy()
-    expr_mask.data[:] = 1.0
-    ext_mask = ext_d_n.copy()
-    ext_mask.data[:] = 1.0
-    intr_mask = expr_mask.multiply(ext_mask).tocsr()  # nonzero only at intersection
+    # distance of each expression edge u-v, looked up in the condensed vector
+    u = np.repeat(np.arange(n_cells), np.diff(expr_conn.indptr))
+    v = expr_conn.indices.astype(np.int64)
+    if perm is not None:
+        u, v = perm[u], perm[v]
+    lo, hi = np.minimum(u, v), np.maximum(u, v)
+    off_diag = lo < hi
+    d = np.full(expr_conn.nnz, np.nan)
+    d[off_diag] = dc[_pair_index(n_cells, lo[off_diag], hi[off_diag])]
 
-    # Blended connectivity at intersection positions
-    intr_c = (
-        expr_c_n.multiply(intr_mask) * (1 - alpha) + ext_c_n.multiply(intr_mask) * alpha
+    # kept edges: (1 - alpha) expression connectivity + alpha spatial similarity 1 - d/d_max
+    keep = (d >= 0) & (d <= threshold)
+    conn = (expr_conn.data / expr_conn_max).astype(np.float64)
+    # when every kept distance is 0 (threshold 0), each kept pair is fully similar
+    blended = (1 - alpha) * conn + alpha * (1.0 - d / (d_max or 1.0))
+    not_kept = 0.0 if mode == "intersection" else (1 - alpha) * conn
+    int_conn_csr = sp.csr_matrix(
+        (np.where(keep, blended, not_kept), expr_conn.indices, expr_conn.indptr),
+        shape=expr_conn.shape,
+        copy=True,
     )
+    int_conn_csr.eliminate_zeros()
 
-    if mode == "intersection":
-        int_conn_csr = intr_c.tocsr()
-
-        _log.detail(
-            f"Intersection: {intr_mask.nnz} edges "
-            f"(from expr={expr_c_n.nnz}, dist={ext_d_n.nnz})"
-        )
-
-    elif mode == "expression":
-        # expr-only positions: expression has a connectivity, ext does not.
-        expr_only_c = expr_c_n - expr_c_n.multiply(intr_mask)
-        expr_only_c.eliminate_zeros()
-        expr_only_c_blend = expr_only_c * (1 - alpha)
-        int_conn_csr = (intr_c + expr_only_c_blend).tocsr()
-
-        n_both = intr_mask.nnz
-        n_expr_only = expr_only_c.nnz
-
+    info = {
+        "alpha": alpha,
+        "p_keep": p_keep,
+        "expr_conn_max": float(expr_conn_max),
+        "ext_dist_max": float(d_max),
+    }
+    if mode == "expression":
+        n_both = int(keep.sum())
+        n_expr_only = int(np.count_nonzero(conn[~keep]))
         _log.detail(f"Integration: {n_both} edges in both, {n_expr_only} expr-only")
         _log.detail(f"Integrated graph: {int_conn_csr.nnz} total edges")
-
+        info.update(n_edges_both=n_both, n_edges_expr_only=n_expr_only)
     else:
-        raise ValueError(
-            f"mode must be 'intersection' or 'expression', got {mode!r}")
-
-    if mode == "expression":
-        info = {
-            "alpha": alpha,
-            "p_keep": p_keep,
-            "expr_conn_max": float(expr_conn_max),
-            "ext_dist_max": float(ext_dist_max),
-            "n_edges_both": int(n_both),
-            "n_edges_expr_only": int(n_expr_only),
-        }
-    else:  # intersection
-        info = {
-            "alpha": alpha,
-            "p_keep": p_keep,
-            "expr_conn_max": float(expr_conn_max),
-            "ext_dist_max": float(ext_dist_max),
-            "ext_dist_threshold_raw": float(threshold),
-            "ext_dist_unfiltered_max": ext_dist_unfiltered_max,
-            "n_edges_intersection": int(int_conn_csr.nnz),
-            "n_edges_expr": int(expr_conn.nnz),
-            "n_edges_dist_filtered": int(ext_dist_filt.nnz),
-        }
+        _log.detail(
+            f"Intersection: {int(keep.sum())} edges "
+            f"(from expr={expr_conn.nnz}, dist={2 * n_kept})"
+        )
+        info.update(
+            ext_dist_threshold_raw=float(threshold),
+            ext_dist_unfiltered_max=float(d_top),
+            n_edges_intersection=int(int_conn_csr.nnz),
+            n_edges_expr=int(expr_conn.nnz),
+            n_edges_dist_filtered=2 * n_kept,
+        )
     return int_conn_csr, info
 
 
@@ -566,7 +530,7 @@ def integrate(
     adata_sc,
     adata_dist=None,
     alpha: float = 0.3,
-    p_keep: float = 0.32,
+    p_keep: float = 0.3,
     mode: str = "intersection",
     neighbors_key: str = "neighbors",
     key_added: str | None = None,
@@ -587,17 +551,23 @@ def integrate(
     ----------
     adata_sc : anndata.AnnData or str
         Single-cell object with a KNN graph in ``.obsp``. Path to ``.h5ad`` accepted.
-    adata_dist : anndata.AnnData or str, optional
-        Distance object, ``X`` of shape ``(n_cells, n_cells)`` (e.g. from
-        :func:`wasserstein`), aligned to ``adata_sc`` by ``obs_names``. Without cell
+    adata_dist : anndata.AnnData, pandas.DataFrame or str, optional
+        Cell-cell distances: an AnnData from :func:`wasserstein` (condensed vector in
+        ``uns["distances"]``, NaN for undefined pairs), or a square ``(n_cells, n_cells)``
+        matrix as an AnnData's ``X`` (dense or sparse) or a DataFrame labeled by cell on
+        both axes; a path to an ``.h5ad`` is also accepted. A square matrix is
+        max-symmetrized and its diagonal ignored. Every entry of a dense matrix is a
+        distance, 0 included; a sparse matrix's absent entries are no distance, and its
+        stored zeros are distance 0. Aligned to ``adata_sc`` by cell name; without cell
         names it is read in ``adata_sc``'s order (with a warning when ``adata_sc`` has
-        cell names). ``None`` (no spatial
+        cell names). Integration works on the condensed vector (``4 n_cells^2`` bytes); a
+        square input is converted to it a block of rows at a time. ``None`` (no spatial
         input) builds the plain expression graph: ``mode="expression"`` only, and
         ``alpha``/``p_keep`` are ignored.
     alpha : float, default 0.3
         Spatial blending weight in ``[0, 1]``. ``0`` drops the spatial term: with
         ``mode="expression"`` the result is then the plain expression graph.
-    p_keep : float, default 0.32
+    p_keep : float, default 0.3
         Quantile of distance values kept when filtering the distance graph.
     mode : {"intersection", "expression"}, default "intersection"
         Integration mode (see above).
@@ -662,9 +632,7 @@ def integrate(
         # at alpha=0 builds from any distance matrix, since that blend never reads it.
         if mode != "expression":
             raise ValueError(
-                f"mode={mode!r} needs adata_dist: the intersection graph keeps only the "
-                "expression edges between spatially close cells. Without a distance "
-                "matrix only mode='expression' (the plain expression graph) can be built."
+                f"mode={mode!r} needs adata_dist; without it only mode='expression' works."
             )
         expr_conn_max = expr_conn.data.max()
         int_conn_csr = expr_conn.copy()
@@ -684,11 +652,8 @@ def integrate(
     conn_sym.eliminate_zeros()
     if conn_sym.nnz == 0:
         raise ValueError(
-            f"Integration left no edges at alpha={alpha}, p_keep={p_keep}, mode={mode!r}. "
-            "At alpha=1.0 the expression side is dropped entirely and the blended "
-            "connectivity is the prior's similarity alone, which is 0 on its longest kept "
-            "edge -- so a prior with a single distinct distance yields an empty graph. "
-            "Lower alpha, or raise p_keep."
+            f"Integration left no edges at alpha={alpha}, p_keep={p_keep}, mode={mode!r}: "
+            "lower alpha or raise p_keep."
         )
     raw_cost = -np.log(conn_sym.data)
     cost_cap = float(np.quantile(raw_cost, _COST_CAP_QUANTILE))
@@ -755,7 +720,7 @@ def graphs(
     adata_dist=None,
     *,
     alpha: float = 0.3,
-    p_keep: float = 0.32,
+    p_keep: float = 0.3,
     modes=None,
     neighbors_key: str = "neighbors",
     verbose: int | bool = 1,
@@ -770,12 +735,12 @@ def graphs(
 
     Parameters
     ----------
-    adata_sc, adata_dist : anndata.AnnData
+    adata_sc, adata_dist
         As for :func:`integrate`. Without ``adata_dist`` only the plain expression graph
         (``"expr"``) is built.
     alpha, p_keep, neighbors_key
         Passed through to :func:`integrate` for every mode (defaults ``alpha=0.3``,
-        ``p_keep=0.32``).
+        ``p_keep=0.3``).
     modes : sequence of str, optional
         Which graphs to build, stored as ``graph="expr"`` and ``graph="intr"``. Default:
         both, or ``("expression",)`` when there is no ``adata_dist``.

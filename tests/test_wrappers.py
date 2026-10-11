@@ -70,7 +70,7 @@ def test_trajectory_source_only_ranks_the_fates_and_leaves_the_choice(toy, capsy
     returns it, and assigns no lineages: the caller picks the fates."""
     expr, dist = toy
     out = dt.pp.graphs(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
-    with pytest.warns(UserWarning, match=r"no lineages were assigned.*sink_clusters") as rec:
+    with pytest.warns(UserWarning, match=r"no lineages assigned.*sink_clusters") as rec:
         res = dt.tl.trajectory(out, ["source"], None, cluster_key="clusters", graph="intr",
                                basis="spatial", p_end=0.2, verbose=1)
     assert rec[0].filename == __file__
@@ -127,11 +127,11 @@ def test_source_only_ranks_its_own_run_and_is_quiet_at_verbose_0(toy, capsys):
                      basis="spatial", p_end=0.2, verbose=0)
     flat = dt.tl.terminality(out, cluster_key="clusters", source_clusters=["source"],
                              show=False)
-    with pytest.warns(UserWarning, match="no lineages were assigned") as rec:
+    with pytest.warns(UserWarning, match="no lineages assigned") as rec:
         res = dt.tl.trajectory(out, ["source"], None, cluster_key="clusters", graph="intr",
                                basis="spatial", p_end=0.2, verbose=0, key_added="x")
     assert len([w for w in rec if "no lineages" in str(w.message)]) == 1
-    assert "printed" not in str(rec[0].message) and "key_added='x'" in str(rec[0].message)
+    assert "key_added='x'" in str(rec[0].message)
     assert "cluster terminality" not in capsys.readouterr().out
     ranked = dt.tl.terminality(out, cluster_key="clusters", source_clusters=["source"],
                                key_added="x", show=False)
