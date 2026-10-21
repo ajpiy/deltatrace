@@ -4,6 +4,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import pytest
+import scipy.sparse as sp
 from _line_toy import line_toy
 
 import deltatrace as dt
@@ -168,15 +169,15 @@ def test_without_a_distance_matrix_the_expression_graph_is_alpha_zero():
 def test_the_intersection_graph_needs_a_distance_matrix():
     adata, _ = line_toy(n=60)
     with pytest.raises(ValueError, match="needs adata_dist"):
-        dt.pp.integrate(adata, verbose=0)                  # mode="intersection" by default
+        dt.pp.integrate(adata, mode="intersection", verbose=0)
     with pytest.raises(ValueError, match="needs adata_dist"):
-        dt.pp.graphs(adata, modes=("expression", "intersection"), verbose=0)
+        dt.pp.integrate(adata, modes=("expression", "intersection"), verbose=0)
 
 
 def test_graphs_and_trajectory_run_without_spatial_input():
-    """pp.graphs(adata) builds just 'expr', and trajectory then runs on it by default."""
+    """pp.integrate(adata) builds just 'expr', and trajectory then runs on it by default."""
     adata, _ = line_toy(n=150)
-    g = dt.pp.graphs(adata, verbose=0)
+    g = dt.pp.integrate(adata, verbose=0)
     assert [k for k in g.obsp if k.startswith("neighbors_")] == [
         "neighbors_expr_distances", "neighbors_expr_connectivities"]
     dt.tl.trajectory(g, ["source"], ["sink"], verbose=0)
@@ -327,7 +328,7 @@ def test_unreachable_cells_are_told_to_hold_a_placeholder():
                 if a != b:
                     m[a, b] = 1.0 if key == "connectivities" else 0.5
         adata.obsp[key] = m.tocsr()
-    g = dt.pp.graphs(adata, verbose=0)
+    g = dt.pp.integrate(adata, verbose=0)
     with pytest.warns(UserWarning, match="placeholder") as rec:
         dt.tl.trajectory(g, ["source"], ["sink"], verbose=0)
     ours = [w for w in rec if "placeholder" in str(w.message)]
@@ -362,7 +363,7 @@ def test_every_distance_format_gives_the_same_graphs(crypt150, form, tmp_path):
 
     adata, D, names = crypt150
     obs = pd.DataFrame(index=names)
-    ref = dt.pp.graphs(adata, ad.AnnData(X=D, obs=obs, var=obs), verbose=0)
+    ref = dt.pp.integrate(adata, ad.AnnData(X=D, obs=obs, var=obs), verbose=0)
     dist = {
         "dense": lambda: ad.AnnData(X=D, obs=obs),
         "sparse": lambda: ad.AnnData(X=sp.csr_matrix(D), obs=obs),
@@ -372,7 +373,7 @@ def test_every_distance_format_gives_the_same_graphs(crypt150, form, tmp_path):
     if dist is None:
         _condensed(D, names).write_h5ad(tmp_path / "d.h5ad")
         dist = lambda: str(tmp_path / "d.h5ad")  # noqa: E731
-    assert _bits(dt.pp.graphs(adata, dist(), verbose=0)) == _bits(ref)
+    assert _bits(dt.pp.integrate(adata, dist(), verbose=0)) == _bits(ref)
 
 
 def test_an_asymmetric_matrix_takes_the_larger_entry(crypt150):
@@ -380,17 +381,17 @@ def test_an_asymmetric_matrix_takes_the_larger_entry(crypt150):
     rng = np.random.default_rng(0)
     A = D * rng.uniform(0.5, 1.5, D.shape)
     obs = pd.DataFrame(index=names)
-    out = dt.pp.graphs(adata, ad.AnnData(X=A, obs=obs), verbose=0)
-    ref = dt.pp.graphs(adata, _condensed(np.maximum(A, A.T), names), verbose=0)
+    out = dt.pp.integrate(adata, ad.AnnData(X=A, obs=obs), verbose=0)
+    ref = dt.pp.integrate(adata, _condensed(np.maximum(A, A.T), names), verbose=0)
     assert _bits(out) == _bits(ref)
 
 
 def test_condensed_distances_are_realigned_by_name(crypt150):
     adata, D, names = crypt150
-    ref = dt.pp.graphs(adata, _condensed(D, names), verbose=0)
+    ref = dt.pp.integrate(adata, _condensed(D, names), verbose=0)
     perm = np.random.default_rng(1).permutation(len(names))
     shuffled = _condensed(D[np.ix_(perm, perm)], [names[k] for k in perm])
-    out = dt.pp.graphs(adata, shuffled, verbose=0)
+    out = dt.pp.integrate(adata, shuffled, verbose=0)
     assert _bits(out) == _bits(ref)
     shuffled.obs_names = ["x" + n for n in shuffled.obs_names]
     with pytest.raises(ValueError, match="different cells"):
@@ -494,3 +495,22 @@ def test_all_zero_distances_still_raise(sc_with_knn, form):
         dist.X = dist.X * 0.0                                # sparse keeps its stored zeros
     with pytest.raises(ValueError, match="no nonzero entries"):
         dt.pp.integrate(sc_with_knn, dist, verbose=False)
+
+
+def test_square_to_condensed_does_not_mutate_coo_matrix():
+    from deltatrace._preprocessing import _square_to_condensed
+
+    row = np.array([0, 1, 0])
+    col = np.array([1, 0, 1])
+    data = np.array([1.0, 1.0, 2.0])
+    coo = sp.coo_matrix((data, (row, col)), shape=(3, 3))
+    row_copy = coo.row.copy()
+    col_copy = coo.col.copy()
+    data_copy = coo.data.copy()
+
+    dc = _square_to_condensed(coo)
+    assert np.array_equal(coo.row, row_copy)
+    assert np.array_equal(coo.col, col_copy)
+    assert np.array_equal(coo.data, data_copy)
+    assert len(coo.data) == 3
+    assert not np.isnan(dc[0])

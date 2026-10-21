@@ -15,7 +15,7 @@ import deltatrace as dt
 @pytest.fixture(scope="module")
 def solved():
     """A finished flow with no velocity grid yet, so each test computes its own."""
-    ad_g = dt.pp.graphs(*line_toy(n=120), alpha=0.9, p_keep=0.3, verbose=0)
+    ad_g = dt.pp.integrate(*line_toy(n=120), alpha=0.9, p_keep=0.3, verbose=0)
     dt.tl.trajectory(ad_g, ["source"], ["sink"], basis="spatial", p_end=0.2,
                      compute_velocity=False, verbose=0)
     return ad_g

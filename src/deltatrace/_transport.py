@@ -9,7 +9,8 @@ import pandas as pd
 import scipy.sparse as sp
 import scipy.sparse.csgraph as csg
 import scipy.sparse.linalg as spla
-from scipy.optimize import linprog, minimize
+from numba import njit
+from scipy.optimize import linprog
 
 from . import _log
 from ._endpoints import endpoints
@@ -20,9 +21,7 @@ from ._utils import (
     _as_labels,
     _check_labels,
     _graph_distances_key,
-    _graph_from_key,
     _off_lcc_mask,
-    _renamed_kwargs,
     _resolve_basis,
     _resolve_graph,
     _suffix,
@@ -33,8 +32,7 @@ from ._utils import (
 # tl.qrot  (+ pseudotime reconnection helper)
 # ---------------------------------------------------------------------------
 def _reconnect_pseudotime(
-    adata_basis,
-    adata_clust,
+    adata,
     pt_dict: dict,
     graph: str = "intr",
     reconnect_graph: str = "expr",
@@ -42,40 +40,44 @@ def _reconnect_pseudotime(
     """Give every off-LCC cell the pseudotime of its nearest connected cell, by
     Dijkstra on the reconnect_graph graph (unreachable cells fall back to the LCC
     median). Returns the full {cell name: pseudotime} mapping."""
-    disc_mask = _off_lcc_mask(adata_basis, graph)
+    # Find disconnected / off-LCC cells
+    disc_mask = _off_lcc_mask(adata, graph)
 
     if disc_mask is None:
         disc_col = f"disconnected_{graph}"
         fallback_col = "disconnected_intr"
-        if disc_col in adata_basis.obs.columns:
-            disc_mask = adata_basis.obs[disc_col].astype(bool).values
-        elif fallback_col in adata_basis.obs.columns:
-            disc_mask = adata_basis.obs[fallback_col].astype(bool).values
+        if disc_col in adata.obs.columns:
+            disc_mask = adata.obs[disc_col].astype(bool).values
+        elif fallback_col in adata.obs.columns:
+            disc_mask = adata.obs[fallback_col].astype(bool).values
         else:
             _log.detail("No disconnected nodes: all pseudotimes already assigned.")
             return dict(pt_dict)
 
-    disc_names = list(adata_basis.obs_names[disc_mask])
+    disc_names = list(adata.obs_names[disc_mask])
 
     if len(disc_names) == 0:
         _log.detail("No off-LCC nodes: all pseudotimes already assigned.")
         return dict(pt_dict)
 
-    clust_names = adata_clust.obs_names
+    clust_names = adata.obs_names
     name_to_idx = {name: i for i, name in enumerate(clust_names)}
 
+    # Identify connected donor cells in LCC with known pseudotime
     donor = ~clust_names.isin(disc_names) & clust_names.isin(list(pt_dict))
     connected_names_list = list(clust_names[donor])
     connected_indices = np.flatnonzero(donor)
 
-    dist_key = _graph_distances_key(adata_clust, reconnect_graph)
+    # Load distance matrix for reconnection graph
+    dist_key = _graph_distances_key(adata, reconnect_graph)
     if dist_key is None:
         raise ValueError(
             f"No graph {reconnect_graph!r} to reconnect off-LCC cells through. Pass a graph "
-            "from pp.graphs (e.g. reconnect_graph='expr') or a scanpy key_added."
+            "from pp.integrate (e.g. reconnect_graph='expr') or a scanpy key_added."
         )
-    D_clust = adata_clust.obsp[dist_key].tocsr()
+    D_clust = adata.obsp[dist_key].tocsr()
 
+    # Max-symmetrize distance matrix and clear diagonal
     dist_sym = (D_clust + D_clust.T) / 2
     if dist_sym.diagonal().any():    # setdiag on an empty diagonal inserts zeros (scipy<1.13 warns)
         dist_sym.setdiag(0)
@@ -84,20 +86,19 @@ def _reconnect_pseudotime(
     _targets = [n for n in sorted(disc_names) if n in name_to_idx]
     if _targets and not connected_indices.size:
         raise ValueError(
-            "No LCC cell of adata_clust has a pseudotime: no donor to reconnect the "
+            "No LCC cell of adata has a pseudotime: no donor to reconnect the "
             f"{len(_targets)} off-LCC cells from."
         )
     _log.detail(f"Reconnecting {len(_targets)} off-LCC cells from "
                 f"{len(connected_indices)} LCC donors...")
-    # Each target's distance to its nearest donor, then one Dijkstra from the target cut
-    # just past it: argmin over the donors in obs order resolves a tie to the first donor.
-    # The 1e-9 slack only absorbs the two directions summing a path in a different order.
+    # Dijkstra search from all donors to find nearest donor distance per cell
     d_nearest = csg.dijkstra(dist_sym, indices=connected_indices, min_only=True)
 
     pseudotime_full = dict(pt_dict)
     assigned = 0
     fallback = []
 
+    # Reassign pseudotime from closest reachable donor
     for disc_name in _targets:
         t = name_to_idx[disc_name]
         if np.isfinite(d_nearest[t]):
@@ -110,6 +111,7 @@ def _reconnect_pseudotime(
         else:
             fallback.append(disc_name)
 
+    # Fall back to median LCC pseudotime for completely unreachable cells
     if fallback:
         connected_pts = [pseudotime_full[n] for n in connected_names_list]
         median_pt = float(np.median(connected_pts))
@@ -124,7 +126,7 @@ def _reconnect_pseudotime(
         )
 
     if _log.wants_detail():
-        n_total = len(adata_basis.obs_names)
+        n_total = len(adata.obs_names)
         _log.detail(
             f"pseudotime reassignment: {len(connected_names_list)} connected, "
             f"{assigned} reassigned via geodesic"
@@ -135,31 +137,34 @@ def _reconnect_pseudotime(
     return pseudotime_full
 
 
-def _median_off_lcc_pseudotime(adata_basis, pt_dict: dict, graph: str | None = None) -> dict:
+def _median_off_lcc_pseudotime(adata, pt_dict: dict, graph: str | None = None) -> dict:
     """Set every off-LCC cell's pseudotime to the median of the LCC cells' (an
     explicit, reproducible placeholder, not an inferred position). No-op if
-    adata_basis is None or there are no off-LCC cells."""
+    adata is None or there are no off-LCC cells."""
     pt_full = dict(pt_dict)
-    if adata_basis is None:
+    if adata is None:
         return pt_full
 
-    off_mask = _off_lcc_mask(adata_basis, graph)
+    # Locate off-LCC cells
+    off_mask = _off_lcc_mask(adata, graph)
     if off_mask is None:
         _log.detail("No graph to locate the LCC: off-LCC pseudotimes left as solved.")
         return pt_full
 
-    names = np.asarray([str(nm) for nm in adata_basis.obs_names])
+    names = np.asarray([str(nm) for nm in adata.obs_names])
     off_names = [nm for nm in names[off_mask] if nm in pt_full]
     if not off_names:
         _log.detail("No off-LCC cells: every pseudotime came from the solved LCC.")
         return pt_full
 
+    # Compute median pseudotime of connected LCC cells
     lcc_vals = np.array([pt_full[nm] for nm in names[~off_mask] if nm in pt_full], float)
     lcc_vals = lcc_vals[np.isfinite(lcc_vals)]
     if lcc_vals.size == 0:
         _log.detail(f"No finite LCC pseudotime: {len(off_names)} off-LCC cells left as is.")
         return pt_full
 
+    # Assign LCC median placeholder to off-LCC cells
     median_pt = float(np.median(lcc_vals))
     for nm in off_names:
         pt_full[nm] = median_pt
@@ -169,102 +174,491 @@ def _median_off_lcc_pseudotime(adata_basis, pt_dict: dict, graph: str | None = N
 
 
 # ---------------------------------------------------------------------------
-# QROT solver: the dual, by SciPy (trust region, Newton, midpoint of the free potentials)
+# QROT solver: the dual, by a capped trust region then Newton (Armijo line search, tau continuation, midpoint of
+# the free potentials)
 # ---------------------------------------------------------------------------
-def _solve_qrot(tail, head, c, f, tau, gtol=1e-4, tol=1e-12, eps=1e-8, max_iter=300):
+@njit(cache=True)
+def _armijo_step(s, dd, slope, tau):
+    """Largest t in 1, 1/2, 1/4, ... (down to 1e-12) with dual(p + t d) - dual(p) >= 1e-4 t slope.
+
+    s = p[head] - p[tail] - c and dd = d[head] - d[tail] per edge; the gain is summed per edge to
+    avoid cancellation, in one pass over the edges per trial t."""
+    # Initialize trial step size t
+    t = 1.0
+    while t > 1e-12:
+        acc = 0.0
+        # Sum exact quadratic dual gain across edges to avoid cancellation
+        for e in range(s.shape[0]):
+            ds = t * dd[e]
+            s1 = s[e] + ds
+            if s[e] > 0:
+                acc += -ds * ds if s1 > 0 else s[e] * (2 * ds + s[e])
+            elif s1 > 0:
+                acc += -s1 * s1
+        # Check Armijo sufficient decrease condition
+        if t * slope + acc / (2 * tau) >= 1e-4 * t * slope:
+            return t
+        # Backtrack: halve step size
+        t /= 2
+    return t
+
+
+@njit(cache=True)
+def _slack_residual(p, tail, head, c, f, tau, tol_abs):
+    """Edge slacks s = p[head] - p[tail] - c, Kirchhoff residual r of J = s_+ / tau, and whether |r| is within
+    tol_abs plus the rounding of the potentials, in one pass over the edges (same sums, in the same order, as
+    the bincounts they replace)."""
+    n, m = f.shape[0], head.shape[0]
+    s = np.empty(m)
+    inflow, outflow = np.zeros(n), np.zeros(n)
+    w_in, w_out = np.zeros(n), np.zeros(n)
+    ulp = np.finfo(np.float64).eps
+    # Single pass over edges: compute slacks, flows, and potential rounding bounds
+    for e in range(m):
+        ph, pt = p[head[e]], p[tail[e]]
+        se = ph - pt - c[e]
+        s[e] = se
+        J = max(se, 0.0) / tau
+        inflow[head[e]] += J
+        outflow[tail[e]] += J
+        # Track numerical precision threshold from potential magnitude
+        rnd = ulp * (abs(ph) + abs(pt))
+        w = rnd / tau if se > -rnd else 0.0
+        w_in[head[e]] += w
+        w_out[tail[e]] += w
+    # Kirchhoff residual: demand minus net flow
+    r = f - inflow + outflow
+    # Check if residual is within absolute tolerance plus potential rounding
+    bound = tol_abs + w_in + w_out
+    return s, r, bool(np.all(np.abs(r) <= bound))
+
+
+@njit(cache=True)
+def _grounded_free(idx, lab, k):
+    """The cells of idx (ascending) except the first of each piece lab, which grounds that piece."""
+    seen = np.zeros(k, dtype=np.bool_)
+    keep = np.ones(idx.shape[0], dtype=np.bool_)
+    # Ground the first node encountered in each component piece
+    for i in range(idx.shape[0]):
+        if seen[lab[idx[i]]]:
+            continue
+        seen[lab[idx[i]]] = True
+        keep[i] = False
+    return idx[keep]
+
+
+@njit(cache=True)
+def _count_lower(indptr, indices, order, budget):
+    """Nonzeros of the strict lower Cholesky factor of the symmetric pattern A[order][:, order] (CSR indptr,
+    indices), counted while building the elimination tree (row subtrees, one pass); budget + 1 once the count
+    exceeds budget, so a dense factor is detected without counting it."""
+    n = order.shape[0]
+    # Build inverse permutation mapping
+    rank = np.empty(n, np.int64)
+    for k in range(n):
+        rank[order[k]] = k
+    parent = np.full(n, -1, np.int64)
+    flag = np.full(n, -1, np.int64)
+    count = 0
+    # Traverse elimination tree row by row
+    for k in range(n):
+        v = order[k]
+        flag[k] = k
+        for q in range(indptr[v], indptr[v + 1]):
+            i = rank[indices[q]]
+            if i >= k:
+                continue
+            # Follow path in elimination tree up to root
+            while flag[i] != k:
+                flag[i] = k
+                count += 1
+                if parent[i] == -1:
+                    parent[i] = k
+                i = parent[i]
+            # Early exit if nonzeros exceed sparsity budget
+            if count > budget:
+                return budget + 1
+    return count
+
+
+@njit(cache=True)
+def _tr_eval(p, tail, head, c, f, tau, scale):
+    """Negative dual objective and its gradient (scaled by scale) in one pass over the edges."""
+    n, m = f.shape[0], tail.shape[0]
+    # Initialize gradient with negative demand
+    g = -f.copy()
+    jj = 0.0
+    # Accumulate active edge flow contributions to gradient and quadratic objective
+    for e in range(m):
+        u, v = tail[e], head[e]
+        s = p[v] - p[u] - c[e]
+        if s > 0.0:
+            J = s / tau
+            jj += J * J
+            g[v] += J
+            g[u] -= J
+    # Scale linear demand term and gradient entries
+    fp = 0.0
+    for i in range(n):
+        fp += f[i] * p[i]
+        g[i] /= scale
+    return -(fp - 0.5 * tau * jj) / scale, g
+
+
+@njit(cache=True)
+def _tr_hessp(tail, head, d, inv_tau_scale, n):
+    """Active-Laplacian Hessian-vector product (B_a B_a^T d) / (tau * scale)."""
+    out = np.zeros(n)
+    # Apply Laplacian of active edges to direction vector d
+    for e in range(tail.shape[0]):
+        u, v = tail[e], head[e]
+        dv = (d[v] - d[u]) * inv_tau_scale
+        out[v] += dv
+        out[u] -= dv
+    return out
+
+
+@njit(cache=True)
+def _trust_ncg(p, tail, head, c, f, tau, scale, eps=1e-8, gtol=1e-4, maxiter=100, max_cg=20, ftol=1e-6):
+    """Steihaug-Toint Newton-CG trust-region warm start on the negative dual (Nocedal & Wright Alg. 7.2).
+
+    Uses Newton's active edges (s > -eps) so shortest-path tree edges at s == 0 provide curvature from the start,
+    TRON-style inner CG iteration capping (max_cg=20), relative dual objective plateau early exit (ftol=1e-6),
+    and two-tier trust-radius expansion (3x when rho > 0.9, 2x when rho > 0.75)."""
+    n = p.shape[0]
+    # Initialize trust region bounds and tolerance
+    trust_radius, max_trust_radius, eta = 1.0, 1000.0, 0.05
+    inv_tau_scale = 1.0 / (tau * scale)
+    # Evaluate initial objective and gradient
+    fun, jac = _tr_eval(p, tail, head, c, f, tau, scale)
+    jac_mag = np.sqrt(np.sum(jac * jac))
+    k = 0
+    plateau_count = 0
+    # Outer trust region iteration loop
+    while jac_mag >= gtol and k < maxiter:
+        if not np.isfinite(jac_mag):
+            break
+        # Identify active edge set for Hessian-vector curvature
+        s = p[head] - p[tail] - c
+        a = s > -eps
+        th, hd = tail[a], head[a]
+        # Set inner CG stopping tolerance
+        tol = min(0.5, np.sqrt(jac_mag)) * jac_mag
+        z = np.zeros(n)
+        r = jac.copy()
+        d = -r
+        r_sq = np.sum(r * r)
+        hits_boundary = False
+        cg_iter = 0
+        step = z
+        # Inner Steihaug-Toint Conjugate Gradient loop
+        while cg_iter < max_cg:
+            cg_iter += 1
+            # Compute Hessian-vector product
+            Bd = _tr_hessp(th, hd, d, inv_tau_scale, n)
+            dBd = np.sum(d * Bd)
+            # Handle negative or zero curvature: intercept trust region boundary
+            if dBd <= 0.0 or not np.isfinite(dBd):
+                da = np.sum(d * d)
+                db = 2.0 * np.sum(z * d)
+                dc = np.sum(z * z) - trust_radius * trust_radius
+                disc = np.sqrt(max(db * db - 4.0 * da * dc, 0.0))
+                aux = db + (disc if db >= 0.0 else -disc)
+                tb = -2.0 * dc / aux if aux != 0.0 else 0.0
+                step = z + tb * d
+                hits_boundary = True
+                break
+            # Compute CG step length
+            alpha = r_sq / dBd
+            z_next = z + alpha * d
+            # Check if step leaves trust region sphere
+            if np.sum(z_next * z_next) >= trust_radius * trust_radius:
+                da = np.sum(d * d)
+                db = 2.0 * np.sum(z * d)
+                dc = np.sum(z * z) - trust_radius * trust_radius
+                disc = np.sqrt(max(db * db - 4.0 * da * dc, 0.0))
+                aux = db + (disc if db >= 0.0 else -disc)
+                tb = -2.0 * dc / aux if aux != 0.0 else 0.0
+                step = z + tb * d
+                hits_boundary = True
+                break
+            # Update residual and test convergence
+            r_next = r + alpha * Bd
+            r_next_sq = np.sum(r_next * r_next)
+            if not np.isfinite(r_next_sq):
+                step = z_next
+                break
+            if np.sqrt(r_next_sq) < tol:
+                step = z_next
+                break
+            # Update conjugate direction
+            d = -r_next + (r_next_sq / r_sq) * d
+            z = z_next
+            step = z
+            r = r_next
+            r_sq = r_next_sq
+
+        # Evaluate model predicted reduction
+        step_sq = np.sum(step * step)
+        if not np.isfinite(step_sq):
+            break
+        Bstep = _tr_hessp(th, hd, step, inv_tau_scale, n)
+        pred_red = -(np.sum(jac * step) + 0.5 * np.sum(step * Bstep))
+        if pred_red <= 0.0 or not np.isfinite(pred_red):
+            break
+
+        # Check for objective value plateau
+        rel_gain = pred_red / (abs(fun) + 1.0)
+        if rel_gain < ftol:
+            plateau_count += 1
+            if plateau_count >= 3:
+                break
+        else:
+            plateau_count = 0
+
+        # Evaluate actual reduction at proposed step
+        p_prop = p + step
+        fun_prop, jac_prop = _tr_eval(p_prop, tail, head, c, f, tau, scale)
+        if not np.isfinite(fun_prop):
+            break
+        rho = (fun - fun_prop) / pred_red
+        if not np.isfinite(rho):
+            break
+        # Update trust region radius based on agreement ratio rho
+        if rho < 0.25:
+            trust_radius *= 0.25
+        elif rho > 0.9 and hits_boundary:
+            trust_radius = min(3.0 * trust_radius, max_trust_radius)
+        elif rho > 0.75 and hits_boundary:
+            trust_radius = min(2.0 * trust_radius, max_trust_radius)
+        # Accept proposed step if agreement exceeds threshold eta
+        if rho > eta:
+            p = p_prop
+            fun = fun_prop
+            jac = jac_prop
+            jac_mag = np.sqrt(np.sum(jac * jac))
+        k += 1
+    return p, k, bool(jac_mag < gtol)
+
+
+_LU = dict(diag_pivot_thresh=0.0, options=dict(SymmetricMode=True))
+
+
+class _LinearSolver:
+    """The Newton systems of one solve (grounded active Laplacians), each by SuperLU or by PyAMG-preconditioned CG.
+
+    LU unless the system has at least n0 rows and SuperLU's factors would hold at least fill times the nonzeros of
+    the system (lower half). That fill is pre-screened in Reverse Cuthill-McKee order and, when borderline, counted
+    exactly in SuperLU's own MMD order (from a near-zero-fill spilu), and recounted only once the system has changed
+    by more than delta since the last count; in between the last choice stands. CG runs to rtol on a
+    smoothed-aggregation hierarchy with a deterministic prolongation smoother; a system it does not solve to rtol
+    falls back to LU, and so do the next ones until the next count."""
+
+    def __init__(self, n0=3000, fill=40.0, delta=0.05, rtol=1e-8):
+        self.n0, self.fill, self.delta, self.rtol = n0, fill, delta, rtol
+        self.ref, self.amg = None, False
+        self._lu_cache = (None, None)
+        self._amg_cache = (None, None, None)
+        self.counts = {"lu": 0, "amg": 0}
+
+    def solve(self, A, b):
+        n = A.shape[0]
+        if n == 0:
+            return np.zeros(0)
+        order = None
+        # Assess factorization strategy if system size exceeds threshold
+        if n >= self.n0 and (self.ref is None or abs(A.nnz / self.ref[0] - 1) > self.delta
+                             or abs(n / self.ref[1] - 1) > self.delta):
+            # Screen Cholesky factor fill-in budget in Reverse Cuthill-McKee order
+            lower = (A.nnz + n) / 2
+            budget = int(np.ceil(self.fill * lower / 2 - n))
+            indptr, indices = A.indptr.astype(np.int64), A.indices.astype(np.int64)
+            rcm = csg.reverse_cuthill_mckee(A, symmetric_mode=True).astype(np.int64)
+            cnt_rcm = _count_lower(indptr, indices, rcm, budget)
+            if cnt_rcm <= budget:
+                self.amg = False
+            else:
+                # Count fill-in in SuperLU's MMD permutation
+                order = np.argsort(spla.spilu(A.tocsc(), drop_tol=1e10, fill_factor=1, permc_spec="MMD_AT_PLUS_A",
+                                              **_LU).perm_c)
+                count = _count_lower(indptr, indices, order, budget)
+                self.amg = count > budget
+            self.ref = (A.nnz, n)
+            # Factorize with SuperLU if sparsity budget allows
+            if not self.amg and order is not None:
+                self.counts["lu"] += 1
+                lu = spla.splu(A[order][:, order].tocsc(), permc_spec="NATURAL", **_LU)
+                def _solve_ord(rhs, _lu=lu, _ord=order):
+                    out = np.empty(len(_ord))
+                    out[_ord] = _lu.solve(rhs[_ord])
+                    return out
+                self._lu_cache = (A, _solve_ord)
+                return _solve_ord(b) if b.any() else np.zeros(n)
+        # Attempt PyAMG-preconditioned CG for dense factor systems
+        if n >= self.n0 and self.amg:
+            x = self._amg(A, b)
+            if x is not None:
+                self.counts["amg"] += 1
+                return x
+            self.amg = False                     # LU until the next count
+        # Default: solve via SuperLU sparse factorization
+        self.counts["lu"] += 1
+        if not b.any():
+            return np.zeros(n)
+        if self._lu_cache[0] is not A:
+            self._lu_cache = (A, spla.splu(A.tocsc(), permc_spec="MMD_AT_PLUS_A", **_LU).solve)
+        return self._lu_cache[1](b)
+
+    def _amg(self, A, b):
+        import pyamg
+
+        if A.nnz >= 2**31:
+            return None
+        b2 = float((b * b).sum())
+        if b2 == 0.0:
+            return np.zeros_like(b)
+        # Construct or reuse smoothed aggregation AMG preconditioner
+        if self._amg_cache[0] is A:
+            _, A32, M = self._amg_cache
+        else:
+            A32 = sp.csr_matrix((A.data, A.indices.astype(np.int32), A.indptr.astype(np.int32)), shape=A.shape)
+            ml = pyamg.smoothed_aggregation_solver(A32, symmetry="hermitian", max_coarse=500,
+                                                   smooth=("jacobi", {"omega": 4.0 / 3.0, "weighting": "local"}))
+            M = ml.aspreconditioner()
+            self._amg_cache = (A, A32, M)
+        # Execute preconditioned Conjugate Gradient iterations
+        x = np.zeros_like(b)
+        r = b.copy()
+        tol2 = (self.rtol ** 2) * b2
+        z = M(r)
+        p = z.copy()
+        rz = float((r * z).sum())
+        for _ in range(1000):
+            Ap = A32 @ p
+            pAp = float((p * Ap).sum())
+            if pAp <= 0.0:
+                break
+            alpha = rz / pAp
+            x += alpha * p
+            r -= alpha * Ap
+            if float((r * r).sum()) <= tol2:
+                break
+            z = M(r)
+            rz_new = float((r * z).sum())
+            p = z + (rz_new / rz) * p
+            rz = rz_new
+        # Check residual convergence tolerance
+        res = b - A32 @ x
+        return x if float((res * res).sum()) <= 100.0 * tol2 else None
+
+
+def _auto_tau(tail, head, n):
+    """tau = 0.3 times the cells in the largest connected piece of the graph (the benchmark's rule)."""
+    if n == 0:
+        return 1.0
+    _, lab = csg.connected_components(sp.coo_matrix((np.ones(len(tail)), (tail, head)), shape=(n, n)),
+                                      directed=False)
+    return 0.3 * float(np.bincount(lab).max())
+
+
+def _validate_tau(tau):
+    """tau as a float, or "auto"; positivity and finiteness are checked by _solve_qrot."""
+    if isinstance(tau, str):
+        if tau != "auto":
+            raise ValueError(f'tau must be a positive number or "auto", got {tau!r}.')
+        return tau
+    try:
+        arr = np.asarray(tau, dtype=float)
+    except (TypeError, ValueError):
+        arr = None
+    if arr is None or arr.size != 1:
+        raise ValueError(f'tau must be a positive number or "auto", got {tau!r}.')
+    return float(arr.item())
+
+
+def _check_tau(tau, tail, head, n):
+    """tau as a float: "auto" resolved by _auto_tau."""
+    tau = _validate_tau(tau)
+    if tau == "auto":
+        tau = _auto_tau(tail, head, n)
+        _log.detail(f"tau='auto': {tau:g} (0.3 x nodes in the largest connected piece)")
+    return tau
+
+
+def _solve_qrot(tail, head, c, f, tau, gtol=1e-4, tr_maxiter=100, tol=1e-12, eps=1e-8, max_iter=3000,
+                linear_solver=None):
     """Optimal flow J and potentials p of the QROT dual (see qrot)."""
+    # Validate regularization and cost parameters
     if not (np.isfinite(tau) and tau > 0):
         raise ValueError(f"tau must be a positive finite number, got {tau!r}.")
+    c = np.asarray(c, dtype=float)
+    if not np.isfinite(c).all() or (c < 0).any():
+        raise ValueError("Edge costs must be finite and nonnegative.")
     n, m = len(f), len(tail)
     scale = np.abs(f).max()
 
-    # demand must balance on every graph piece
-    _, lab = csg.connected_components(sp.coo_matrix((np.ones(m), (tail, head)), shape=(n, n)), directed=False)
-    if scale == 0 or np.any(np.abs(np.bincount(lab, f)) > tol * scale * np.bincount(lab)):
+    # Demand must balance on every graph piece
+    _, piece = csg.connected_components(sp.coo_matrix((np.ones(m), (tail, head)), shape=(n, n)), directed=False)
+    if scale == 0 or np.any(np.abs(np.bincount(piece, f)) > tol * scale * np.bincount(piece)):
         raise ValueError("The demand (sinks minus sources) is zero or does not balance on a connected piece "
                          "of the graph.")
 
+    # Primal edge flow function from dual potentials
     def flow(p):
         return np.maximum(p[head] - p[tail] - c, 0.0) / tau
 
+    # Kirchhoff residual function: net imbalance per node
     def residual(J):
         return f - np.bincount(head, J, minlength=n) + np.bincount(tail, J, minlength=n)
 
-    def gain(p, d, t, r):
-        # dual(p + t d) - dual(p), summed per edge to avoid cancellation
-        s0 = p[head] - p[tail] - c
-        ds = t * (d[head] - d[tail])
-        s1 = s0 + ds
-        on0, on1 = s0 > 0, s1 > 0
-        term = np.where(on0 & on1, -ds**2, 0.0)
-        term = np.where(on0 & ~on1, s0 * (2 * ds + s0), term)
-        term = np.where(~on0 & on1, -s1**2, term)
-        return t * (r @ d) + term.sum() / (2 * tau)
-
-    # tau continuation near the LP limit (tau max|f| < max c / 10)
+    # Set up tau continuation ladder near the LP limit (tau max|f| < max c / 10)
     k = max(np.ceil(np.log10(0.1 * c.max() / (tau * scale))), 0) if c.max() > 0 else 0
     taus = tau * 10.0 ** np.arange(k, -1, -1)
-    tau = taus[0]
+    tau = float(taus[0])
 
-    # start: shortest-path distance from the sources
+    # Initialize potentials using shortest-path distance from sources
     G = sp.csr_matrix((c, (tail, head)), shape=(n, n))
     dist = csg.dijkstra(G, indices=np.flatnonzero(f < 0), min_only=True)
     reached = np.isfinite(dist)
     p = np.where(reached, dist, dist[reached].max())
 
-    # trust region (state cached per point); its model uses Newton's edges, s > -eps, so the shortest-path
-    # edges at their cost give it curvature from the start
-    cache = {}
+    # Start trust-region Newton-CG warm start
+    if tr_maxiter > 0:
+        p, tr_nit, tr_ok = _trust_ncg(p, tail, head, c, f, tau, float(scale), eps, gtol, tr_maxiter)
+    else:
+        tr_nit, tr_ok = 0, False
 
-    def state(p):
-        if not np.array_equal(cache.get("p"), p):
-            s = p[head] - p[tail] - c
-            a = s > -eps
-            cache.update(p=p.copy(), J=np.maximum(s, 0.0) / tau, tail=tail[a], head=head[a])
-        return cache
-
-    def neg_dual(p):
-        J = state(p)["J"]
-        return -(f @ p - 0.5 * tau * (J @ J)) / scale
-
-    def hessp(p, v):
-        st = state(p)
-        dv = (v[st["head"]] - v[st["tail"]]) / tau
-        return (np.bincount(st["head"], dv, minlength=n) - np.bincount(st["tail"], dv, minlength=n)) / scale
-
-    tr = minimize(neg_dual, p, jac=lambda p: -residual(state(p)["J"]) / scale,
-                  hessp=hessp, method="trust-krylov", options=dict(gtol=gtol, maxiter=1000))
-    p = tr.x
-
-    # newton refinement
+    # Start Newton iterations across tau continuation levels
+    linear_solver = _LinearSolver() if linear_solver is None else linear_solver
+    steps = []
     for tau in taus:
+        tau = float(tau)
+        steps.append(0)
+        prev_a = None
         for _ in range(max_iter):
-            s = p[head] - p[tail] - c
-            r = residual(np.maximum(s, 0.0) / tau)
-            # converged: residual below tol or within rounding
-            rnd = np.finfo(float).eps * (np.abs(p[head]) + np.abs(p[tail]))
-            w = np.where(s > -rnd, rnd / tau, 0.0)
-            if np.all(np.abs(r) <= tol * scale + np.bincount(head, w, minlength=n) + np.bincount(tail, w, minlength=n)):
+            # Compute edge slacks and Kirchhoff residual; check convergence
+            s, r, converged = _slack_residual(p, tail, head, c, f, tau, tol * scale)
+            if converged:
                 break
 
-            # hessian: laplacian of the active edges
+            # Assemble Hessian: Laplacian of active edges (s > -eps)
             a = s > -eps
-            A = sp.coo_matrix((np.full(a.sum(), 1.0 / tau), (tail[a], head[a])), shape=(n, n))
-            L = csg.laplacian((A + A.T).tocsr()).tocsr()
+            if prev_a is None or not np.array_equal(a, prev_a):
+                prev_a = a
+                A = sp.coo_matrix((np.full(a.sum(), 1.0 / tau), (tail[a], head[a])), shape=(n, n))
+                L = csg.laplacian((A + A.T).tocsr()).tocsr()
+                k, lab = csg.connected_components(L, directed=False)
+                size = np.bincount(lab)
+                free = _grounded_free(np.flatnonzero(L.diagonal() > 0), lab, k)
+                L_free = L[1:, 1:] if k == 1 and free.size == n - 1 and free[0] == 1 else L[free][:, free]
 
-            # newton step per piece, grounded at one cell
-            k, lab = csg.connected_components(L, directed=False)
-            size = np.bincount(lab)
+            # Solve Newton system for free potentials grounded at one cell per piece
             mean = np.bincount(lab, r) / size
             mean[np.abs(mean) <= tol * scale] = 0.0
-            idx = np.flatnonzero(L.diagonal() > 0)
-            _, first = np.unique(lab[idx], return_index=True)
-            free = np.setdiff1d(idx, idx[first])
             d = np.zeros(n)
-            d[free] = spla.splu(L[free][:, free].tocsc(), permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0,
-                                options=dict(SymmetricMode=True)).solve((r - mean[lab])[free])
+            d[free] = linear_solver.solve(L_free, (r - mean[lab])[free])
 
-            # shift pieces with a net residual until a boundary edge opens
+            # Shift disconnected pieces with net residual until a boundary edge opens
             if mean.any():
                 cut = lab[tail] != lab[head]
                 gap_in, gap_out = np.full(k, np.inf), np.full(k, np.inf)
@@ -274,51 +668,55 @@ def _solve_qrot(tail, head, c, f, tau, gtol=1e-4, tol=1e-12, eps=1e-8, max_iter=
                 move = np.where(np.isfinite(move), move, 0.0) - np.where(mean != 0, np.bincount(lab, d) / size, 0.0)
                 d += move[lab]
 
-            # armijo line search
-            t, slope = 1.0, r @ d
-            while gain(p, d, t, r) < 1e-4 * t * slope and t > 1e-12:
-                t /= 2
-            p = p + t * d
+            # Execute Armijo line search on exact dual gain and update potentials
+            p = p + _armijo_step(s, d[head] - d[tail], float((r * d).sum()), tau) * d
+            steps[-1] += 1
         else:
+            # Check LP feasibility if Newton loop failed to converge
             B = sp.coo_matrix((np.r_[-np.ones(m), np.ones(m)], (np.r_[tail, head], np.r_[np.arange(m), np.arange(m)])), shape=(n, m))
             if linprog(np.zeros(m), A_eq=B, b_eq=f / scale, method="highs").status == 2:
                 raise ValueError("The demand is infeasible: along the edge directions, the sources' mass cannot reach the sinks.")
             raise RuntimeError(f"QROT did not converge: Kirchhoff residual {np.abs(r).max():.2e} after {max_iter} Newton steps")
 
-    # zero unresolvable flows, then center the free potentials
+    # Zero unresolvable flows below tolerance
     J = flow(p)
     J[J <= tol * scale + np.finfo(float).eps * (np.abs(p[head]) + np.abs(p[tail])) / tau] = 0.0
     off = np.abs(residual(J)).max()
-    _log.detail(f"solver: dual trust region ({tr.nit} steps) + Newton, Kirchhoff residual {off:.1e}")
+    _log.detail(f"solver: trust region {tr_nit} steps ({'converged' if tr_ok else 'capped'}), Newton {sum(steps)} "
+                f"steps over {len(steps)} tau levels (max {max(steps)} per level; {linear_solver.counts['lu']} LU, "
+                f"{linear_solver.counts['amg']} AMG-CG), Kirchhoff residual {off:.1e}")
     if off > 1e-6 * scale:
         warnings.warn(f"The flow misses the demand by {off / scale:.0e} of its size, below the solver's "
                       "resolution: raise tau, or scale the costs and masses toward 1.",
                       RuntimeWarning, skip_file_prefixes=(_PKG_DIR,))
-    return J, _midpoint_free_potentials(tail, head, c, J, p, tau)
+    # Center potentials on unconstrained pieces and return flow and potentials
+    return J, _midpoint_free_potentials(tail, head, c, J, p, tau, piece=piece)
 
 
-def _midpoint_free_potentials(tail, head, c, J, p, tau):
+def _midpoint_free_potentials(tail, head, c, J, p, tau, piece=None):
     """Potentials the flow leaves free, at the midpoint of their optimal range; NaN where unbounded."""
     n, on = len(p), J > 0
     if not on.any():
         return np.full(n, np.nan)
 
-    # slack of every edge at p (>= 0), plus zero-slack reverse edges along the flow; parallel edges keep the smallest
+    # Build slack graph with zero-slack reverse edges along active flow
     t, h = np.r_[tail, head[on]], np.r_[head, tail[on]]
     s = np.r_[np.maximum(c + tau * J - (p[head] - p[tail]), 0.0), np.zeros(on.sum())]
     o = np.lexsort((s, h, t))
     o = o[np.r_[True, (np.diff(t[o]) != 0) | (np.diff(h[o]) != 0)]]
     G = sp.csr_matrix((s[o], (t[o], h[o])), shape=(n, n))
 
-    # reference: one flow group per graph piece
+    # Pick one reference node per connected flow component piece
     cells = np.unique(np.r_[tail[on], head[on]])
     _, group = csg.connected_components(sp.coo_matrix((np.ones(on.sum()), (tail[on], head[on])), shape=(n, n)), directed=False)
-    _, piece = csg.connected_components(sp.coo_matrix((np.ones(len(tail)), (tail, head)), shape=(n, n)), directed=False)
+    if piece is None:
+        _, piece = csg.connected_components(sp.coo_matrix((np.ones(len(tail)), (tail, head)), shape=(n, n)), directed=False)
     ref = cells[np.isin(group[cells], group[cells[np.unique(piece[cells], return_index=True)[1]]])]
 
-    # latest and earliest optimal potential of every cell, then their midpoint
+    # Compute earliest and latest admissible dual potential bounds via shortest paths
     up = csg.dijkstra(G, indices=ref, min_only=True)
     down = csg.dijkstra(G.T.tocsr(), indices=ref, min_only=True)
+    # Center unconstrained potentials at the midpoint of their admissible interval
     with np.errstate(invalid="ignore"):
         return np.where(np.isfinite(up) & np.isfinite(down), p + (up - down) / 2, np.nan)
 
@@ -335,98 +733,92 @@ def _normalize_costs(c, cost_range):
     return c
 
 
-@_renamed_kwargs(tag="graph", reconnect_key=("reconnect_graph", _graph_from_key))
 @_log.stage("solving quadratically regularized transport")
 def qrot(
     graph_result: dict,
-    tau: float = 100,
+    adata=None,
+    tau: float | str = "auto",
     normalize_costs: bool = True,
     cost_range: tuple = (1e-6, 1.0),
     verbose: int | bool = 1,
-    adata_basis=None,
-    adata_clust=None,
     reconnect: bool = True,
     reconnect_graph: str = "expr",
     graph: str | None = None,
     key_added: str | None = None,
 ) -> None:
-    """Transport flow from source to sink cells and read pseudotime off the potentials.
+    """Solve quadratically regularized optimal transport and compute pseudotime.
 
-    Quadratically regularized optimal transport (QROT) on the directed cell graph. The
-    primal pushes a flow J along the edges at cost c, meeting the demand f that
-    :func:`endpoints` built:
+    Computes flow `J` along graph edges satisfying the source-sink demand `f`
+    constructed by :func:`deltatrace.tl.endpoints`:
 
-        min_{J >= 0}   <c, J> + (tau/2) ||J||^2
-        s.t.           B J = f
+        min_{J >= 0}   <c, J> + (tau / 2) ||J||^2
+        s.t.           B^T J = f = b - a
 
-    B is the cell-edge incidence matrix (for an edge e = u -> v, B[u, e] = -1 and
-    B[v, e] = +1). The dual has one potential p per cell:
-
-        max_p   <f, p> - (1 / (2 tau)) || (B^T p - c)_+ ||^2
-
-    tied to the primal by the slackness relation ``J = (B^T p - c)_+ / tau``, with
-    ``(B^T p)_e = p_v - p_u``: an edge carries flow only where ``p_v > p_u + c_e``, so
-    the potential rises strictly from sources to sinks. Min-max scaled to ``[0, 1]``,
-    p IS the pseudotime.
-
-    The dual is solved directly (SciPy trust region, then Newton steps on the Laplacian of
-    the flow edges) to a Kirchhoff residual of 1e-12 relative to the demand (or its rounding
-    floor). Cells no flow touches, and the offsets between groups of cells the flow joins,
-    are only bounded by ``p_v - p_u <= c_e``; each is placed at the midpoint of its earliest
-    and latest optimal value (two shortest-path searches on the edge slacks).
+    where `B` is the cell-edge incidence matrix and `c` are edge costs. The dual
+    potentials `p` satisfy the slackness relation ``J = (B p - c)_+ / tau``.
+    Scaled to ``[0, 1]``, the potentials define continuous cellular pseudotime.
 
     Parameters
     ----------
     graph_result : dict
-        Output of :func:`endpoints` (keys ``"G"``, ``"cost_vec"``, ``"f"``), or of
-        ``CellGraph.to_networkx()``, whose result is a networkx.DiGraph.
-    tau : float, default 100
-        Regularization strength; larger ``tau`` opens more edges and spreads the flow.
-    normalize_costs, cost_range
-        Min-max scale edge costs into ``cost_range`` before solving.
+        Flow problem dictionary from :func:`deltatrace.tl.endpoints`.
+    adata : anndata.AnnData, optional
+        Target AnnData to write results into. Writes ``obs["pseudotime"]``,
+        ``obs["pseudotime_raw"]``, and ``uns["dt_flow"]`` (containing edge flow array
+        `J`, edge index pairs `edges`, and `tau`).
+    tau : float or "auto", default "auto"
+        Quadratic regularization parameter. ``"auto"`` sets tau to 0.3 times the
+        number of nodes in the graph's largest connected piece.
+    normalize_costs : bool, default True
+        Whether to min-max scale edge costs into `cost_range` prior to solving.
+    cost_range : tuple of float, default (1e-6, 1.0)
+        Target range for normalized edge costs.
     verbose : int or bool, default 1
-        Logging verbosity.
-    adata_basis : anndata.AnnData, optional
-        If given, writes ``obs["pseudotime_raw"]`` (before reconnection; NaN for cells
-        in graph pieces without a source or sink, which have no potential, and, with
-        one-way edges, for cells bounded on one side only),
-        ``obs["pseudotime"]`` (after) and ``uns["dt_flow"]`` (``{"J": (n_edges,),
-        "edges": (n_edges, 2)}``).
-    adata_clust : anndata.AnnData, optional
-        Required when ``reconnect=True``, for the geodesic reconnection graph.
+        Verbosity level (0: silent, 1: stages, 2: detailed progress).
     reconnect : bool, default True
-        Give off-LCC cells a pseudotime via nearest-LCC reconnection
-        (:func:`_reconnect_pseudotime`).
+        Give off-LCC cells a pseudotime via nearest-LCC reconnection.
 
         WARNING: with ``reconnect=False`` those cells are instead set to the
         median of the LCC cells' pseudotime -- an explicit placeholder, NOT an
         inferred position. Identify them via ``endpoints``' ``disconnected_info``
         before reading anything into it.
     reconnect_graph : str, default "expr"
-        Graph in ``adata_clust`` whose geodesics reconnect off-LCC cells: a DeltaTrace
-        graph (``neighbors_<reconnect_graph>``), or else a scanpy one stored with
-        ``sc.pp.neighbors(key_added=reconnect_graph)``.
+        Graph key used for reconnecting off-LCC cells (typically ``"expr"``).
     graph : str, optional
-        The stored graph ``endpoints`` sampled on (``neighbors_<graph>``), used to find
-        the off-LCC cells; auto-detected from ``adata_basis`` if ``None``.
+        Graph name the endpoints were sampled on. Auto-detected if None.
     key_added : str, optional
-        Suffix every written key with ``_<key_added>``, so two runs can coexist in
-        one object. ``None`` writes the flat keys.
+        Key suffix for scoping multiple runs (e.g. ``obs["pseudotime_<key_added>"]``).
 
     Returns
     -------
     None
-        Results are written into ``adata_basis`` (when provided).
+        Results are written directly into `adata`.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> dt.tl.qrot(gr, adata=adata, tau="auto")
+    >>> "pseudotime" in adata.obs and "dt_flow" in adata.uns
+    True
     """
     _sfx = _suffix(key_added)
 
+    # Extract flow problem graph, costs, and demand from endpoints
     G = graph_result["G"]
     c = graph_result["cost_vec"]
     f = graph_result["f"]
 
-    if adata_basis is not None:
-        graph = _resolve_graph(adata_basis, graph)
+    # Resolve target graph from AnnData if provided
+    if adata is not None:
+        if isinstance(adata, str):
+            import scanpy as sc
+            adata = sc.read_h5ad(adata)
+        graph = _resolve_graph(adata, graph)
 
+    # Extract edge index arrays and node mapping
     if isinstance(G, CellGraph):
         # endpoints' graph: its nodes are cells 0..n-1 in order, so the node map below
         # would be the identity, and G.edge_array is the old list(G.edges()) as an (m, 2)
@@ -446,16 +838,18 @@ def qrot(
 
     assert len(c) == m, f"cost length {len(c)} != edges {m}"
 
+    # Normalize edge costs into cost_range
     if normalize_costs and m > 0:
         c = _normalize_costs(c, cost_range)
 
-    # Edge tails u and heads v (the incidence matrix B of the docstring, kept as index arrays).
+    # Unpack edge tails u and heads v
     if node_map is None:
         us, vs = E[:, 0], E[:, 1]
     else:
         us = np.array([node_map[u] for u, _ in edges], dtype=np.int64)
         vs = np.array([node_map[v] for _, v in edges], dtype=np.int64)
 
+    # Validate demand vector shape and align with internal indices
     f_arr = np.asarray(f, dtype=float)
     if f_arr.shape != (n,):
         raise ValueError(
@@ -469,45 +863,47 @@ def qrot(
         for v, i in node_map.items():
             f_vec[i] = f_arr[v]
 
+    # Resolve regularization parameter and solve QROT
+    tau = _check_tau(tau, us, vs, n)
     J_opt, p = _solve_qrot(us, vs, c, f_vec, tau)
 
-    _log.detail(f"QROT solved: {m} edges, tau={tau}")
+    _log.detail(f"QROT solved: {m} edges, tau={tau:g}")
     _log.detail(f"  Flow range: [{J_opt.min():.4e}, {J_opt.max():.4e}]")
     _log.detail(f"  Potential range: [{np.nanmin(p):.4e}, {np.nanmax(p):.4e}]")
 
+    # Map raw potentials to cell names
     idx_to_name = G.graph["idx_to_name"]
     if node_map is None:
         pt_raw = {idx_to_name[i]: p[i] for i in range(n)}
     else:
         pt_raw = {idx_to_name[node]: p[i] for node, i in node_map.items()}
 
-    # Min-max the potentials onto [0, 1] (pseudotime); cells without one stay NaN
+    # Min-max scale potentials onto [0, 1] interval to define pseudotime
     _vals = np.array(list(pt_raw.values()))
     _pmin = np.nanmin(_vals)
     _rng = (np.nanmax(_vals) - _pmin) or 1.0
     pt_norm = {k: (v - _pmin) / _rng for k, v in pt_raw.items()}
 
-    if adata_basis is not None:
-        obs_names = adata_basis.obs_names.astype(str)
-        adata_basis.obs[f"pseudotime_raw{_sfx}"] = (
+    # Store results in AnnData
+    if adata is not None:
+        obs_names = adata.obs_names.astype(str)
+        adata.obs[f"pseudotime_raw{_sfx}"] = (
             pd.Series(pt_norm).reindex(obs_names).to_numpy(float)
         )
 
-    if reconnect and adata_clust is not None:
-        pt_full = _reconnect_pseudotime(
-            adata_basis,
-            adata_clust,
-            pt_norm,
-            graph=graph,
-            reconnect_graph=reconnect_graph,
-        )
-    elif not reconnect:
-        pt_full = _median_off_lcc_pseudotime(adata_basis, pt_norm, graph=graph)
-    else:
-        pt_full = dict(pt_norm)
+        # Reconnect off-LCC cells or assign median placeholder
+        if reconnect:
+            pt_full = _reconnect_pseudotime(
+                adata,
+                pt_norm,
+                graph=graph,
+                reconnect_graph=reconnect_graph,
+            )
+        else:
+            pt_full = _median_off_lcc_pseudotime(adata, pt_norm, graph=graph)
 
-    if adata_basis is not None:
-        adata_basis.obs[f"pseudotime{_sfx}"] = (
+        # Write finalized pseudotime column and flow dictionary
+        adata.obs[f"pseudotime{_sfx}"] = (
             pd.Series(pt_full).reindex(obs_names).to_numpy(float)
         )
         if node_map is None:
@@ -515,9 +911,10 @@ def qrot(
             edges_arr = E.copy() if m else np.array([], dtype=np.int64)
         else:
             edges_arr = np.array(edges, dtype=np.int64)
-        adata_basis.uns[f"dt_flow{_sfx}"] = {
+        adata.uns[f"dt_flow{_sfx}"] = {
             "J": J_opt,
             "edges": edges_arr,
+            "tau": float(tau),
         }
 
 
@@ -526,55 +923,59 @@ def qrot_graph(
     graph,
     a,
     b,
-    tau: float = 100,
+    tau: float | str = 100,
     directed: bool = False,
     normalize_costs: bool = True,
     verbose: int | bool = 1,
 ) -> dict:
-    """QROT on any graph in SciPy's csgraph form: flow, potentials and pseudotime.
+    """Solve quadratically regularized optimal transport on a SciPy csgraph.
 
-    The solver behind :func:`qrot`, without AnnData or :func:`endpoints`. Quadratically regularized
-    optimal transport (QROT) moves the mass ``a`` to ``b`` along the edges: it minimizes
-    ``sum_e c_e J_e + (tau / 2) sum_e J_e ** 2`` over flows ``J >= 0`` whose inflow minus outflow is
-    ``b - a`` at every node. Its dual gives every node a potential ``p``: edge i -> j carries flow only
-    where ``p[j] - p[i] > c_ij``, and then ``flow[i, j] = (p[j] - p[i] - c_ij) / tau``, so ``p`` rises
-    from ``a`` to ``b``.
+    The standalone solver behind :func:`qrot`, independent of AnnData. Minimizes:
+
+        min_{J >= 0}   <c, J> + (tau / 2) ||J||^2
+        s.t.           inflow - outflow = b - a
 
     Parameters
     ----------
-    graph : (n, n) scipy sparse array or matrix, numpy array or masked array
-        Edge costs in SciPy's csgraph form: ``graph[i, j]`` is the cost of an edge from i to j. Every
-        stored entry of a sparse graph is an edge, an explicit zero included; in a dense array, 0, inf
-        and NaN are no edge, and so are the masked entries of a masked array. Costs must be finite and
-        nonnegative; self-loops are ignored.
+    graph : (n, n) scipy.sparse array or matrix, or numpy.ndarray
+        Edge costs in SciPy csgraph format: ``graph[i, j]`` is the cost of an edge
+        from i to j. Self-loops are ignored.
     a, b : (n,) array_like
-        Source and sink masses, nonnegative. Only ``b - a`` enters the solve, and it must balance on
-        every connected piece of the graph, since no mass crosses between pieces.
-    tau : float, default 100
-        Regularization strength (> 0); larger ``tau`` spreads the flow over more edges. 100 is
-        DeltaTrace's value for costs up to 1 and masses that total 1; for masses that total M, use
-        ``tau / M``.
+        Non-negative source (`a`) and sink (`b`) mass vectors. Must satisfy
+        ``sum(a) == sum(b)``.
+    tau : float or "auto", default 100
+        Regularization strength. ``"auto"`` sets tau to 0.3 times the number of
+        nodes in the largest connected component.
     directed : bool, default False
-        ``False`` uses every edge in both directions at the same cost; a pair stored both ways keeps the
-        smaller cost. ``True`` uses each stored entry as a one-way edge, and the edge directions must let
-        the mass reach ``b``.
+        Whether the input graph is directed. ``False`` treats edges as bidirectional.
     normalize_costs : bool, default True
-        Divide the costs by the largest before solving, so ``tau`` does not depend on their scale; the
-        cheapest paths stay the cheapest. ``False`` solves on the costs as given.
+        Scale edge costs by dividing by their maximum before solving.
     verbose : int or bool, default 1
-        Logging verbosity.
+        Verbosity level.
 
     Returns
     -------
     dict
-        ``"flow"``: (n, n) scipy.sparse.csr_array, ``flow[i, j]`` the mass sent along i -> j (only edges
-        that carry flow are stored). ``"potential"``: (n,) optimal potentials, in the units of the costs
-        after normalization, with an arbitrary offset per connected piece. Nodes the flow leaves free sit
-        at the midpoint of their optimal range. NaN where the optimum leaves a potential unbounded: every
-        node in a piece without flow and, with ``directed=True``, nodes bounded on one side only.
-        ``"pseudotime"``: the potentials shifted so that every piece starts at 0, then scaled to [0, 1]
-        by the longest piece.
+        Dictionary containing:
+        - ``"flow"``: (n, n) scipy.sparse.csr_array with optimal edge flows.
+        - ``"potential"``: (n,) optimal dual potentials.
+        - ``"pseudotime"``: (n,) potentials shifted to 0 and normalized to [0, 1].
+        - ``"tau"``: the tau value used in the solve.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import scipy.sparse as sp
+    >>> import deltatrace as dt
+    >>> # Line graph: 0 -> 1 -> 2
+    >>> adj = sp.csr_matrix([[0, 1.0, 0], [0, 0, 1.0], [0, 0, 0]])
+    >>> a = np.array([1.0, 0.0, 0.0])
+    >>> b = np.array([0.0, 0.0, 1.0])
+    >>> res = dt.tl.qrot_graph(adj, a, b, tau=1.0, directed=True)
+    >>> res["flow"].nnz > 0
+    True
     """
+    # Validate and standardize input graph format
     G = graph if sp.issparse(graph) or np.ma.isMaskedArray(graph) else np.asarray(graph, dtype=float)
     if G.ndim != 2 or G.shape[0] != G.shape[1]:
         raise ValueError(f"qrot_graph: graph must be square (n, n), got shape {G.shape}.")
@@ -582,6 +983,8 @@ def qrot_graph(
         G = csg.csgraph_from_masked(G) if np.ma.isMaskedArray(G) else csg.csgraph_from_dense(G)
     G = sp.coo_array(sp.csr_array(G))
     n = G.shape[0]
+
+    # Validate source and sink masses and ensure global balance
     a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
     if a.shape != (n,) or b.shape != (n,):
         raise ValueError(f"qrot_graph: a and b need one entry per node ({n}), got {a.shape} and {b.shape}.")
@@ -591,7 +994,7 @@ def qrot_graph(
         raise ValueError(f"qrot_graph: a and b must have the same positive total, got {a.sum()} and {b.sum()}.")
     b = b * (a.sum() / b.sum())     # equal totals to rounding, as the solver's balance check needs
 
-    # edges: stored entries without self-loops; undirected keeps one cost per pair, used both ways
+    # Extract edge list, ignore self-loops, and process edge directions
     keep = G.row != G.col
     tail, head, c = G.row[keep].astype(np.int64), G.col[keep].astype(np.int64), G.data[keep].astype(float)
     if not np.isfinite(c).all() or (c < 0).any():
@@ -606,19 +1009,23 @@ def qrot_graph(
     if normalize_costs and c.max() > 0:
         c = c / c.max()
 
+    # Resolve tau and solve optimal transport problem
+    tau = _check_tau(tau, tail, head, len(a))
     J, p = _solve_qrot(tail, head, c, b - a, tau)
-    _log.detail(f"QROT solved: {c.size} edges, tau={tau}")
+    _log.detail(f"QROT solved: {c.size} edges, tau={tau:g}")
 
+    # Build sparse solution flow array
     flow = sp.csr_array((J, (tail, head)), shape=(n, n))
     flow.eliminate_zeros()
-    # pseudotime: every piece starts at 0 (its offset is arbitrary), one scale for all pieces
+
+    # Shift component potentials to 0 and normalize to [0, 1] pseudotime
     _, piece = csg.connected_components(sp.coo_array((np.ones(c.size), (tail, head)), shape=(n, n)),
                                         directed=False)
     start = np.full(piece.max() + 1, np.inf)
     np.fmin.at(start, piece, p)
     pt = p - start[piece]
     span = np.nanmax(pt) if np.isfinite(pt).any() else 0.0
-    return {"flow": flow, "potential": p, "pseudotime": pt / span if span > 0 else pt}
+    return {"flow": flow, "potential": p, "pseudotime": pt / span if span > 0 else pt, "tau": float(tau)}
 
 
 # ---------------------------------------------------------------------------
@@ -640,50 +1047,63 @@ def compute_velocity_grid(
     flow_key: str | None = None,
     key_added: str | None = None,
 ) -> None:
-    """Turn the solved flow into a smoothed velocity field over an embedding.
+    """Project cellular transport flows onto a regular 2D velocity grid.
 
-    Gives each cell a velocity from the flow-weighted resultant of ALL its edges
-    (net flow ``J[u->v] - J[v->u]``, so back-and-forth transport cancels and a
-    branch point isn't snapped onto its single strongest edge), then smooths those
-    per-cell vectors onto a regular grid by Gaussian-weighted kNN interpolation,
-    ready for a quiver plot.
+    Calculates net velocity vectors per cell by weighting embedding displacements
+    by net transport flows:
+
+        net_flow(u, v) = J(u -> v) - J(v -> u)
+
+    Cell-level velocities are then smoothed onto a regular 2D grid using
+    Gaussian-weighted kNN kernel interpolation.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Must hold ``uns["dt_flow"]`` (from :func:`qrot`) and embedding coordinates
-        for ``basis``.
+        AnnData holding ``uns["dt_flow"]`` (from :func:`deltatrace.tl.qrot`) and
+        embedding coordinates in ``obsm[basis]`` or ``obsm[f"X_{basis}"]``.
     basis : str, default "umap"
-        Embedding name (looked up via ``X_<basis>`` / ``<basis>``).
+        Key identifying the 2D coordinate basis in `adata.obsm`.
     grid_size : tuple of int, default (25, 25)
-        ``(nx, ny)`` number of grid cells along each axis.
+        Number of grid points along each coordinate axis (nx, ny).
     k : int, default 25
-        Cells averaged per grid point when smoothing.
+        Number of nearest cells to interpolate per grid point.
     sigma : float, optional
-        Gaussian bandwidth; defaults to ``0.8 * hypot`` of grid spacing.
+        Bandwidth for Gaussian smoothing. Defaults to 0.8 * hypot of grid step.
     data_radius_factor : float, default 0.7
-        Suppress grid arrows whose nearest cell is farther than
-        ``data_radius_factor * sigma``.
+        Masks grid points farther than ``data_radius_factor * sigma`` from any cell.
     mag_transform : {"log1p", "asinh", "none"}, default "log1p"
-        Magnitude compression applied to arrow lengths.
+        Transform applied to arrow magnitudes for visual contrast.
     transform_scale : float, optional
-        Scale for the magnitude transform; ``None`` uses the 80th percentile.
+        Scale parameter for magnitude transform. Defaults to 80th percentile.
     clip_quantile : float, default 0.99
-        Clip transformed magnitudes at this quantile.
+        Upper quantile clipping threshold for velocity magnitudes.
     edge_threshold : float, default 0
-        Minimum net flow for an edge to contribute to a cell's velocity.
+        Minimum net flow required for an edge to contribute to cell velocity.
     verbose : int or bool, default 1
-        Logging verbosity.
+        Verbosity level.
     flow_key : str, optional
-        ``uns`` key holding the solved flow. Overrides ``key_added`` when given.
+        Specific key in `adata.uns` holding the flow dictionary.
     key_added : str, optional
-        Suffix for the keys read and written, matching the one given to :func:`qrot`.
+        Suffix matching the one given to :func:`deltatrace.tl.qrot`.
 
     Returns
     -------
     None
-        Writes ``adata.uns["dt_grid"]`` (``Xg``/``Yg``/``U``/``V``/``mask``/``basis``/
-        ``edges``) and ``adata.uns["dt_raw_arrows"]`` (per-cell diagnostics).
+        Writes ``adata.uns["dt_grid"]`` with interpolated grid components
+        (``Xg``, ``Yg``, ``U``, ``V``, ``mask``, ``basis``) ready for
+        :func:`deltatrace.pl.velocity` or :func:`deltatrace.pl.pseudotime`.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> dt.tl.qrot(gr, adata=adata)
+    >>> dt.tl.compute_velocity_grid(adata, basis="spatial")
+    >>> "dt_grid" in adata.uns
+    True
     """
     from scipy.spatial import cKDTree
 
@@ -692,15 +1112,17 @@ def compute_velocity_grid(
     # Keep the user's transform_scale so the raw per-cell arrows below honor it too.
     user_transform_scale = transform_scale
 
+    # Retrieve flow data from uns
     flow = adata.uns.get(flow_key)
     if flow is None:
         raise ValueError(
-            f"No flow data in adata.uns['{flow_key}']. Run qrot() with adata_basis set "
+            f"No flow data in adata.uns['{flow_key}']. Run qrot() with adata set "
             f"(and the same key_added) first."
         )
     edges = flow["edges"]
     J = flow["J"]
 
+    # Extract 2D embedding coordinates
     coords = _resolve_basis(adata, basis)
     if not isinstance(coords, np.ndarray):       # e.g. a DataFrame in obsm
         coords = np.asarray(coords, dtype=float)
@@ -710,7 +1132,7 @@ def compute_velocity_grid(
     J = np.asarray(J, dtype=float)
     nx_grid, ny_grid = grid_size
 
-    # Per-cell velocity
+    # Compute net resultant flow velocity vector per cell
     node_vec = np.zeros((n, 2), dtype=float)
     edges_arr = np.asarray(edges)
     if edges_arr.size:
@@ -728,6 +1150,7 @@ def compute_velocity_grid(
             [np.bincount(u_arr, weights=w[:, j], minlength=n) for j in (0, 1)]
         )
 
+    # Set up regular 2D grid covering embedding bounding box
     x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
     y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
     x_edges = np.linspace(x_min, x_max, nx_grid + 1)
@@ -739,14 +1162,13 @@ def compute_velocity_grid(
     if sigma is None:
         sigma = 0.8 * np.hypot((x_max - x_min) / nx_grid, (y_max - y_min) / ny_grid)
 
-    # One batched KD-tree query for every grid point at once
+    # Query k nearest cells for all grid points using KD-tree
     tree = cKDTree(coords)
     grid_pts = np.column_stack([Xg.ravel(), Yg.ravel()])  # (ny*nx, 2)
     k_eff = min(k, n)
-    # k as a list of ranks keeps the (ny*nx, k_eff) shape even when k_eff == 1
     dists_flat, idxs_flat = tree.query(grid_pts, k=np.arange(1, k_eff + 1))
 
-    # Gaussian-weighted average of the k nearest cells, per grid point
+    # Smooth velocities onto grid points using Gaussian kernel weights
     within_flat = dists_flat[:, 0] <= data_radius_factor * sigma
     w_flat = np.exp(-(dists_flat**2) / (2 * sigma**2))  # (ny*nx, k_eff)
     U_flat = np.sum(w_flat * node_vec[idxs_flat, 0], axis=1)  # (ny*nx,)
@@ -761,7 +1183,7 @@ def compute_velocity_grid(
     V = V_flat.reshape(ny_grid, nx_grid)
     mask = mask_flat.reshape(ny_grid, nx_grid)
 
-    # Compress arrow lengths so the quiver plot is legible, and clip outliers
+    # Compress velocity arrow magnitudes for visual clarity and clip outliers
     mag = np.hypot(U, V)
     mag_pos = mag[mask & (mag > 0)]
 
@@ -906,19 +1328,7 @@ def _velocity_basis(adata, basis):
 
 
 class _TrajectoryResult(dict):
-    """What :func:`trajectory` returns. ``["graph"]``, the endpoints result's key before
-    0.1.0, still reads ``["endpoints"]``, with a FutureWarning."""
-
-    def __missing__(self, key):
-        if key == "graph":
-            warnings.warn(
-                'trajectory()["graph"] is deprecated and will be removed; use '
-                '["endpoints"] instead.',
-                FutureWarning,
-                stacklevel=2,
-            )
-            return self["endpoints"]
-        raise KeyError(key)
+    """What :func:`trajectory` returns."""
 
     def __repr__(self):
         ep = self.get("endpoints") or {}
@@ -936,7 +1346,7 @@ class _TrajectoryResult(dict):
 
 def _trajectory_graph(adata, graph):
     """The graph trajectory() runs on: ``graph`` itself, else the intersection graph when
-    it is stored, else the only graph there is (e.g. ``pp.graphs(adata)`` without a
+    it is stored, else the only graph there is (e.g. ``pp.integrate(adata)`` without a
     distance matrix stores just ``"expr"``)."""
     if graph is not None:
         return graph
@@ -947,7 +1357,6 @@ def _trajectory_graph(adata, graph):
     return graph
 
 
-@_renamed_kwargs(tag="graph", reconnect_key=("reconnect_graph", _graph_from_key))
 @_log.container()
 def trajectory(
     adata,
@@ -963,7 +1372,7 @@ def trajectory(
     alloc_power: float = 1.0,
     sampling_mode="centered",
     directed_metric: str = "cost",
-    tau: float = 100.0,
+    tau: float | str = "auto",
     seed: int = 42,
     edge_threshold: float = 0,
     compute_velocity: bool = True,
@@ -973,73 +1382,89 @@ def trajectory(
     verbose: int | bool = 1,
     key_added: str | None = None,
 ) -> dict:
-    """Run the whole trajectory pipeline in one call.
+    """Execute the complete DeltaTrace trajectory inference pipeline in one call.
 
-    Composes the public stages: :func:`endpoints` -> :func:`qrot` ->
-    :func:`compute_velocity_grid` -> :func:`lineages`. Those four document the
-    arguments below; this wrapper only forwards them, and each stays callable on
-    its own for when you need to vary one.
-
-    The defaults (``p_end=0.15``, ``p_basis="cluster"``, ``sampling_mode="centered"``,
-    ``tau=100``), with :func:`deltatrace.pp.graphs`' ``alpha=0.3, p_keep=0.3``, are the
-    configuration selected for the intersection graph in the DeltaTrace benchmark
-    (scRNA-seq with a paired ST section). The benchmark did not cover single-cell-
-    resolution ST.
+    Sequentially executes:
+    1. :func:`deltatrace.tl.endpoints`: samples source and sink endpoint cells.
+    2. :func:`deltatrace.tl.qrot`: solves regularized transport and infers pseudotime.
+    3. :func:`deltatrace.tl.compute_velocity_grid`: interpolates 2D velocity vectors (optional).
+    4. :func:`deltatrace.tl.lineages`: computes absorbing Markov chain fate probabilities.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Object carrying the graph(s), e.g. from :func:`deltatrace.pp.graphs`. Must
-        hold ``obs[cluster_key]`` and, for the velocity step, an embedding (see
-        ``basis``).
-    source_clusters, sink_clusters : sequence of str, or None
-        Emitting and absorbing cluster labels, as for :func:`endpoints`.
-        ``sink_clusters=None`` runs SOURCE-ONLY: every non-source cell absorbs, and the
-        clusters are ranked by how terminal the flow makes them (printed, and returned as
-        ``"terminality"``). Lineages are then assigned only if ``omega_term`` or
-        ``n_lineages`` cuts that ranking; otherwise pick the fates from it and run again
-        with them as ``sink_clusters``, which gives the better trajectory.
+        AnnData containing integrated graph(s) from :func:`deltatrace.pp.integrate`
+        and cluster annotations in ``obs[cluster_key]``.
+    source_clusters : sequence of str
+        Progenitor cluster label(s).
+    sink_clusters : sequence of str, optional
+        Terminal cluster label(s). If None, runs in source-only mode.
     graph : str, optional
-        Which stored graph to run on (``neighbors_<graph>``): ``"intr"`` (intersection)
-        or ``"expr"`` from :func:`deltatrace.pp.graphs`, or a name given to
-        :func:`deltatrace.pp.integrate` via ``key_added``. ``None`` takes ``"intr"`` when
-        it is stored, else the only graph there is.
-    cluster_key, p_end, p_basis, alloc_power, sampling_mode,
-    directed_metric, seed, sink_weights
-        Forwarded to :func:`endpoints`, which documents them (the defaults here are
-        the same).
-    tau, reconnect_graph
-        Forwarded to :func:`qrot`.
+        Graph name to run on (e.g. ``"intr"`` or ``"expr"``). Defaults to ``"intr"``
+        when available.
+    cluster_key : str, default "clusters"
+        Column in ``adata.obs`` with cluster labels.
+    p_end : float, default 0.15
+        Endpoint sampling fraction.
+    p_basis : {"cluster", "lcc"}, default "cluster"
+        Sampling allocation basis across clusters.
+    alloc_power : float, default 1.0
+        Cluster quota scaling exponent.
+    sampling_mode : str or dict, default "centered"
+        Endpoint sampling strategy (``"centered"`` or ``"random"``).
+    directed_metric : {"cost", "hops"}, default "cost"
+        Metric used for geodesic distances in centered sampling.
+    tau : float or "auto", default "auto"
+        QROT regularization strength.
+    reconnect_graph : str, default "expr"
+        Graph key used to reconnect off-LCC disconnected cells.
     basis : str, optional
-        Embedding for the velocity grid; forwarded to :func:`compute_velocity_grid`.
-        ``None`` uses the tissue (``obsm['X_spatial']`` or ``obsm['spatial']``) when
-        present as finite 2-D coordinates, else ``X_umap``. Checked before the solve.
+        Embedding coordinate key for velocity grid (e.g. ``"spatial"`` or ``"umap"``).
+    seed : int, default 42
+        Random seed for sampling.
+    edge_threshold : float, default 0
+        Minimum flow threshold for active edges in lineage Markov chain.
     compute_velocity : bool, default True
-        Run :func:`compute_velocity_grid` at all (it needs the ``basis`` embedding).
-    edge_threshold, omega_term, n_lineages
-        Forwarded to :func:`lineages`. ``omega_term``/``n_lineages`` are the two
-        mutually exclusive source-only terminal cuts, meaningful only when
-        ``sink_clusters is None``.
+        Whether to compute the velocity grid field.
+    omega_term : float, optional
+        Terminality score cutoff for source-only lineage discovery.
+    n_lineages : int, optional
+        Number of lineages to discover in source-only mode.
+    sink_weights : {"uniform", "cluster_balanced"}, default "uniform"
+        Demand weight distribution in source-only mode.
     verbose : int or bool, default 1
-        Forwarded to every stage.
+        Verbosity level.
     key_added : str, optional
-        Namespace this run's results. ``None`` writes the flat keys
-        (``obs['pseudotime']``, ``obsm['path_cellweights']``, …); given a name,
-        every per-run key gains a ``_<key_added>`` suffix, letting two runs
-        coexist in one object. Graph keys (``neighbors_<graph>_*``) are scoped by
-        ``graph`` instead and are never suffixed.
+        Namespace suffix for written keys.
 
     Returns
     -------
     dict
-        ``{"endpoints": <endpoints result>, "lineages": <lineages result>}``.
-        Pseudotime, velocity and the lineage keys are written into ``adata`` in place. A
-        source-only run without a cut returns ``"lineages": None`` and adds
-        ``"terminality"``, the ranking to choose the fates from.
+        Dictionary containing ``"endpoints"`` and ``"lineages"`` results.
+        Pseudotime, velocity grid, and lineage probabilities are written directly
+        into `adata`. In source-only mode without a cutoff, returns ``"terminality"``
+        ranking table.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> res = dt.tl.trajectory(
+    ...     adata,
+    ...     source_clusters=["progenitor"],
+    ...     sink_clusters=["fate_A", "fate_B"],
+    ...     basis="spatial",
+    ... )
+    >>> "pseudotime" in adata.obs and "lineage" in adata.obs
+    True
     """
-    # up front: a bad terminal-cut combination or a missing embedding must not cost the
+    # up front: a bad terminal-cut combination, tau or a missing embedding must not cost the
     # caller a full solve.
     _check_terminal_cut(sink_clusters, omega_term, n_lineages)
+    tau = _validate_tau(tau)
+    if tau != "auto" and not (np.isfinite(tau) and tau > 0):
+        raise ValueError(f"tau must be a positive finite number, got {tau!r}.")
     source_clusters = _as_labels(source_clusters, "source_clusters")
     if sink_clusters is not None:
         sink_clusters = _as_labels(sink_clusters, "sink_clusters")
@@ -1049,14 +1474,14 @@ def trajectory(
     if compute_velocity:
         basis = _velocity_basis(adata, basis)
     gr = endpoints(
-        adata, adata, source_clusters, sink_clusters,
+        adata, source_clusters, sink_clusters,
         p_end=p_end, sampling_mode=sampling_mode,
         cluster_key=cluster_key, graph=graph, seed=seed, sink_weights=sink_weights,
         verbose=verbose, directed_metric=directed_metric, p_basis=p_basis,
         alloc_power=alloc_power,
     )
     qrot(
-        gr, tau=tau, adata_basis=adata, adata_clust=adata, reconnect=True,
+        gr, adata=adata, tau=tau, reconnect=True,
         reconnect_graph=reconnect_graph, graph=graph, verbose=verbose,
         key_added=key_added,
     )
@@ -1069,14 +1494,12 @@ def trajectory(
         # merge the fates of any branching system.
         rank = dict(cluster_key=cluster_key, source_clusters=source_clusters,
                     edge_threshold=edge_threshold, key_added=key_added)
-        tab = terminality(adata, show=False, **rank)
+        tab = terminality(adata, show=bool(_log.resolve(verbose) > 0), **rank)
         if len(tab) == 0:
             raise ValueError(
                 "Source-only run: no cluster receives flow from another cluster, so there "
                 "are no fates to rank. Check source_clusters and cluster_key."
             )
-        if _log.resolve(verbose) > 0:
-            terminality(adata, show=True, **rank)
         omega, _ = suggest_omega(tab["term_score"].to_numpy())
         picked = [str(c) for c in tab.index[tab["term_score"] >= omega]]
         call = (f"dt.tl.lineages(adata=adata, source_clusters={[str(c) for c in source_clusters]}"

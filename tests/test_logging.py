@@ -122,7 +122,7 @@ def test_exception_does_not_leak_the_level(capsys):
 # ------------------------------------------------------------------ composing wrappers
 def test_detail_works_in_a_container_body(capsys):
     """container() publishes the level too, so a composing wrapper can emit detail from
-    its own body — previously dead at every verbosity (see pp.graphs)."""
+    its own body — previously dead at every verbosity (see pp.integrate)."""
     @_log.container()
     def compose(verbose=1):
         _log.detail("from the container body")

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import functools
 import os
-import warnings
 from collections.abc import Mapping
 from types import SimpleNamespace
 
@@ -26,7 +24,7 @@ def _resolve_graph(adata, graph=None):
             raise ValueError(
                 f"No graph {graph!r} in this object (neighbors_{graph}); it holds "
                 f"{stored if stored else 'none'}. 'intr' is built by "
-                f"dt.pp.graphs(adata, adata_dist), 'expr' also by dt.pp.graphs(adata)."
+                f"dt.pp.integrate(adata, adata_dist), 'expr' also by dt.pp.integrate(adata)."
             )
         return graph
     candidates = [
@@ -40,8 +38,8 @@ def _resolve_graph(adata, graph=None):
         return candidates[0]
     if not candidates:
         raise ValueError(
-            "No DeltaTrace graph found: run dt.pp.graphs(adata, adata_dist), or "
-            "dt.pp.graphs(adata) without spatial input."
+            "No DeltaTrace graph found: run dt.pp.integrate(adata, adata_dist), or "
+            "dt.pp.integrate(adata) without spatial input."
         )
     raise ValueError(
         f"Multiple integrated graphs found: {candidates}. Pass graph= explicitly."
@@ -331,18 +329,6 @@ _MODE_GRAPHS = {
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
 
 
-def _graph_from_key(key) -> str:
-    """The graph a pre-0.1 ``reconnect_key`` named: ``"neighbors_expr"`` -> ``"expr"``. Any
-    other key (a scanpy graph stored with ``key_added=<key>``) passes through unchanged, and
-    :func:`_graph_distances_key` finds it under either spelling."""
-    if not isinstance(key, str) or not key.removeprefix("neighbors_"):
-        raise ValueError(
-            f"reconnect_key={key!r} does not name a graph. Pass reconnect_graph=<graph> "
-            f"instead, e.g. reconnect_graph='expr'."
-        )
-    return key.removeprefix("neighbors_")
-
-
 def _graph_distances_key(adata, graph: str) -> str | None:
     """``obsp`` key of the distances of the graph named ``graph``: a DeltaTrace graph
     (``neighbors_<graph>``) first, else a scanpy one stored with ``key_added=<graph>``
@@ -354,40 +340,6 @@ def _graph_distances_key(adata, graph: str) -> str | None:
             if cand is not None and cand in adata.obsp:
                 return cand
     return None
-
-
-def _renamed_kwargs(**renames):
-    """Keep accepting keyword names used before 0.1.0, with a FutureWarning.
-
-    Each value is the new parameter name, or ``(new_name, convert)`` where ``convert``
-    maps the old value onto the new parameter's (``reconnect_key="neighbors_expr"`` ->
-    ``reconnect_graph="expr"``). Passing both names is a TypeError. Apply it outside
-    ``_log.stage`` so the stage binds the new names.
-    """
-    def deco(fn):
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            for old, spec in renames.items():
-                if old not in kwargs:
-                    continue
-                new, convert = spec if isinstance(spec, tuple) else (spec, None)
-                if new in kwargs:
-                    raise TypeError(
-                        f"{fn.__name__}() got both {old}= and {new}=; pass only {new}=."
-                    )
-                value = kwargs.pop(old)
-                kwargs[new] = convert(value) if convert is not None else value
-                warnings.warn(
-                    f"{fn.__name__}(): {old}= is deprecated and will be removed; "
-                    f"use {new}={kwargs[new]!r} instead.",
-                    FutureWarning,
-                    stacklevel=2,
-                )
-            return fn(*args, **kwargs)
-
-        return wrapper
-
-    return deco
 
 
 def _suffix(key_added: str | None) -> str:

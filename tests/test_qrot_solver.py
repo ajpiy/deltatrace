@@ -10,7 +10,13 @@ import scipy.sparse.csgraph as csg
 from scipy.optimize import linprog
 from scipy.spatial import cKDTree
 
-from deltatrace._transport import _normalize_costs, _solve_qrot
+from deltatrace._transport import (
+    _armijo_step,
+    _count_lower,
+    _LinearSolver,
+    _normalize_costs,
+    _solve_qrot,
+)
 from deltatrace.tl import qrot_graph
 
 
@@ -92,7 +98,7 @@ def test_infeasible_direction_raises(tail, head, f):
 
 # --------------------------------------------------------------------- newton
 def test_tiny_sinks_get_their_demand():
-    """Sinks of 1e-9, far below the trust region's gtol, still receive exactly their demand."""
+    """Sinks of 1e-9, nine decades below the source, still receive exactly their demand."""
     t, h, c = [0, 0, 0, 0, 1, 2, 3, 4], [1, 2, 3, 4, 0, 0, 0, 0], [1e-6, 1.0, 0.5, 1e-6] * 2
     t, h, c = np.array(t), np.array(h), np.array(c)
     f = np.array([0, -1, 1 - 2e-9, 1e-9, 1e-9])
@@ -111,6 +117,36 @@ def test_near_lp_tau(seed, ratio):
     tau = ratio * c.max() / np.abs(f).max()
     J, p = _solve_qrot(t, h, c, f, tau)
     _check_kkt(t, h, c, f, tau, J, p)
+
+
+def test_islands_need_many_newton_steps():
+    """Islands below the connectivity radius: Newton needs over 300 damped steps on one tau level
+    here, so a small step cap would fail."""
+    t, h, c, f = _rgg(3000, 1)
+    J, p = _solve_qrot(t, h, c, f, 1.0)
+    _check_kkt(t, h, c, f, 1.0, J, p)
+
+
+def test_armijo_step_matches_the_dual_gain():
+    """The compiled line search accepts the first t = 2^-k whose exact dual gain clears the Armijo bound."""
+    rng = np.random.default_rng(0)
+    m, tau = 500, 0.3
+    s, dd = rng.normal(0, 1, m), rng.normal(0, 3, m)
+    slope = 0.5 * np.abs(dd).sum()
+
+    def gain(t):
+        ds = t * dd
+        s1 = s + ds
+        term = np.where((s > 0) & (s1 > 0), -ds**2, 0.0)
+        term = np.where((s > 0) & ~(s1 > 0), s * (2 * ds + s), term)
+        term = np.where(~(s > 0) & (s1 > 0), -s1**2, term)
+        return t * slope + term.sum() / (2 * tau)
+
+    t = 1.0
+    while gain(t) < 1e-4 * t * slope and t > 1e-12:
+        t /= 2
+    assert t < 1.0
+    assert _armijo_step(s, dd, slope, tau) == t
 
 
 def test_rounding_floor():
@@ -332,4 +368,135 @@ def test_qrot_graph_warns_below_the_solver_resolution():
     P = sp.csr_array((np.arange(1.0, 10.0), (np.arange(9), np.arange(1, 10))), shape=(10, 10))
     with pytest.warns(RuntimeWarning, match="misses the demand"):
         qrot_graph(P, np.eye(10)[0] * 1e-15, np.eye(10)[9] * 1e-15, tau=1e-3, verbose=0)
+
+
+
+# --------------------------------------------------------------------- linear solver: LU or AMG-CG per Newton step
+def _knn_d(n, k, d, seed):
+    """Symmetric kNN graph in d dimensions (dense active sets at large tau), costs min-maxed as qrot does."""
+    X = np.random.default_rng(seed).random((n, d))
+    dist, nb = cKDTree(X).query(X, k + 1)
+    D = sp.coo_matrix((dist[:, 1:].ravel(), (np.repeat(np.arange(n), k), nb[:, 1:].ravel())), shape=(n, n))
+    D = D.tocsr().maximum(D.T.tocsr()).tocoo()
+    return D.row.astype(np.int64), D.col.astype(np.int64), _normalize(D.data)
+
+
+def _grounded_laplacian(n, d, seed):
+    t, h, _ = _knn_d(n, 10, d, seed)
+    L = csg.laplacian(sp.coo_matrix((np.ones(t.size), (t, h)), shape=(n, n)).tocsr()).tocsr()
+    return L[1:, 1:].tocsr()
+
+
+@pytest.mark.parametrize("d", [2, 8])
+def test_fill_count_is_superlus(d):
+    """The fill counted in SuperLU's MMD order (from spilu) is the fill splu produces."""
+    A = _grounded_laplacian(600, d, d)
+    kw = dict(permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options=dict(SymmetricMode=True))
+    order = np.argsort(sp.linalg.spilu(A.tocsc(), drop_tol=1e10, fill_factor=1, **kw).perm_c)
+    count = _count_lower(A.indptr.astype(np.int64), A.indices.astype(np.int64), order, 10**12)
+    lu = sp.linalg.splu(A.tocsc(), **kw)
+    assert 2 * (count + A.shape[0]) == lu.L.nnz + lu.U.nnz
+    assert _count_lower(A.indptr.astype(np.int64), A.indices.astype(np.int64), order, 10) == 11
+
+
+def test_fill_count_matches_symbolic_elimination():
+    rng = np.random.default_rng(3)
+    for seed in range(10):
+        W = sp.random(40, 40, 0.08, random_state=seed)
+        A = (csg.laplacian(((W + W.T) > 0).astype(float)) + sp.eye(40)).tocsr()
+        order = rng.permutation(40)
+        B = A[order][:, order].toarray() != 0
+        for k in range(40):
+            nb = np.flatnonzero(B[k, k + 1:]) + k + 1
+            B[np.ix_(nb, nb)] = True
+        assert _count_lower(A.indptr.astype(np.int64), A.indices.astype(np.int64), order, 10**9) == np.tril(B, -1).sum()
+
+
+@pytest.mark.parametrize("tau", [1.0, 300.0])
+def test_amg_steps_give_the_lu_flow(tau):
+    """Every Newton step by AMG-CG reaches the flow every step by LU reaches (the optimum is unique)."""
+    t, h, c = _knn_d(800, 10, 8, 0)
+    f = _demand(800, np.arange(10), np.arange(700, 800))
+    lu, amg = _LinearSolver(n0=10**9), _LinearSolver(n0=0, fill=0.0)
+    J1, p1 = _solve_qrot(t, h, c, f, tau, linear_solver=lu)
+    J2, p2 = _solve_qrot(t, h, c, f, tau, linear_solver=amg)
+    assert lu.counts["amg"] == 0 and amg.counts["amg"] > 0 and amg.counts["lu"] == 0
+    for J, p in ((J1, p1), (J2, p2)):
+        _check_kkt(t, h, c, f, tau, J, p)
+    assert np.abs(J2 - J1).max() <= 1e-9 * J1.max()
+
+
+def test_switch_picks_amg_only_for_dense_factors():
+    """Large tau on a high-dimensional kNN graph makes the factors dense (AMG); small tau keeps them sparse (LU).
+    At this size the fill stays below the default threshold, so the test lowers it."""
+    t, h, c = _knn_d(3000, 15, 10, 1)
+    f = _demand(3000, np.arange(20), np.arange(2900, 3000))
+    dense, sparse = _LinearSolver(n0=1000, fill=10.0), _LinearSolver(n0=1000, fill=10.0)
+    _solve_qrot(t, h, c, f, 900.0, linear_solver=dense)
+    _solve_qrot(t, h, c, f, 1e-2, linear_solver=sparse)
+    assert dense.counts["amg"] > 0 and sparse.counts["amg"] == 0
+
+
+def test_amg_solve_is_deterministic_and_leaves_numpy_rng_alone():
+    A = _grounded_laplacian(2000, 8, 5)
+    b = np.random.default_rng(0).normal(size=A.shape[0])
+    np.random.seed(123)
+    before = np.random.get_state()[1].copy()
+    x1, x2 = (_LinearSolver()._amg(A, b) for _ in range(2))
+    assert np.array_equal(x1, x2)
+    assert np.array_equal(np.random.get_state()[1], before)
+    assert np.linalg.norm(A @ x1 - b) <= 1e-7 * np.linalg.norm(b)
+
+
+# --------------------------------------------------------------------- tau="auto"
+def test_auto_tau_is_0_3_times_the_largest_piece():
+    """Pieces of 6 and 3 nodes: tau = 0.3 * 6, returned with the result."""
+    G = sp.csr_array((np.ones(7), ([0, 1, 2, 3, 4, 6, 7], [1, 2, 3, 4, 5, 7, 8])), shape=(9, 9))
+    a, b = np.r_[1.0, np.zeros(8)], np.r_[np.zeros(5), 1.0, np.zeros(3)]
+    assert qrot_graph(G, a, b, tau="auto", verbose=0)["tau"] == pytest.approx(1.8)
+    assert qrot_graph(G, a, b, verbose=0)["tau"] == 100.0
+
+
+@pytest.mark.parametrize("tau", ["big", [1.0, 2.0], None])
+def test_tau_that_is_not_a_number_or_auto_is_rejected(tau):
+    with pytest.raises(ValueError, match="tau must be a positive"):
+        qrot_graph(np.ones((2, 2)), [1.0, 0], [0, 1.0], tau=tau, verbose=0)
+
+
+def test_size_one_array_tau_is_a_number():
+    res = qrot_graph(np.ones((2, 2)), [1.0, 0], [0, 1.0], tau=np.array([2.0]), verbose=0)
+    assert res["tau"] == 2.0
+
+
+def test_failed_amg_solve_falls_back_to_lu_until_the_next_count():
+    """A system CG cannot solve to rtol is factored, and the next similar one goes straight to LU."""
+    A = _grounded_laplacian(2000, 8, 5)
+    b = np.random.default_rng(0).normal(size=A.shape[0])
+    ls = _LinearSolver(n0=0, fill=0.0, rtol=1e-30)          # unreachable rtol: every CG solve fails
+    x = ls.solve(A, b)
+    assert np.allclose(A @ x, b) and ls.counts == {"lu": 1, "amg": 0} and ls.amg is False
+    calls = []
+    ls._amg = lambda A, b: calls.append(1)
+    ls.solve(A, b)
+    assert calls == [] and ls.counts["lu"] == 2
+
+
+@pytest.mark.parametrize("c", [[-1.0, 1.0], [np.nan, 1.0], [np.inf, 1.0]])
+def test_solve_qrot_rejects_bad_costs(c):
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        _solve_qrot(np.array([0, 1]), np.array([1, 0]), np.array(c), np.array([-1.0, 1.0]), 1.0)
+
+
+def test_trust_ncg_cg_cap_exit():
+    """Inner CG loop exiting on max_cg cap must define step properly and produce finite potentials."""
+    from deltatrace._transport import _trust_ncg
+
+    t, h, c = _knn(50, 6, 42)
+    f = _demand(50, [0], [49])
+    p0 = np.zeros(50)
+    p_out, k, ok = _trust_ncg(p0, t, h, c, f, 1.0, 1.0, maxiter=3, max_cg=1)
+    assert np.isfinite(p_out).all()
+    assert k > 0
+    assert isinstance(ok, bool)
+    assert not np.array_equal(p_out, p0)
 

@@ -80,7 +80,7 @@ def _toy_object(n=240):
                  np.where(t < 2/3, "mid",
                           np.where(i % 3 == 0, "A", np.where(i % 3 == 1, "B", "C"))))
     )
-    return dt.pp.graphs(a, d, alpha=0.9, p_keep=0.3, verbose=0)
+    return dt.pp.integrate(a, d, alpha=0.9, p_keep=0.3, verbose=0)
 
 
 def _line_object(sizes, k=6):
@@ -131,7 +131,7 @@ def _sample(obj, src, snk, p_end, kwargs, seed=42):
     role's total is split with a random remainder, which moves the quotas as the list is
     reordered and would hide what these tests are about.
     """
-    gr = dt.tl.endpoints(obj, obj, list(src), list(snk), cluster_key="clusters", graph="intr",
+    gr = dt.tl.endpoints(obj, list(src), list(snk), cluster_key="clusters", graph="intr",
                          p_end=p_end, seed=seed, verbose=0,
                          **{"p_basis": "cluster", **kwargs})
     lab = obj.obs["clusters"].astype(str).to_numpy()

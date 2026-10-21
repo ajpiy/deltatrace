@@ -23,7 +23,7 @@ from deltatrace._utils import CellGraph, _build_cell_graph, _build_digraph
 
 @pytest.fixture(scope="module")
 def toy():
-    return dt.pp.graphs(*line_toy(n=200), alpha=0.5, verbose=0)
+    return dt.pp.integrate(*line_toy(n=200), alpha=0.5, verbose=0)
 
 
 def _edges_with_data(G):
@@ -42,7 +42,7 @@ def test_edges_and_costs_follow_the_networkx_edge_order(toy):
 
 
 def test_to_networkx_is_the_old_graph_with_its_metadata(toy):
-    gr = dt.tl.endpoints(toy, toy, ["source"], ["sink"], cluster_key="clusters", graph="intr",
+    gr = dt.tl.endpoints(toy, ["source"], ["sink"], cluster_key="clusters", graph="intr",
                          p_end=0.05, verbose=0)
     cg = gr["G"]
     assert isinstance(cg, CellGraph)
@@ -86,7 +86,7 @@ def _components_fixture():
 @pytest.mark.parametrize("mode", ["random", "centered", "directed"])
 def test_largest_component_tie_goes_to_the_lowest_cell(mode):
     obj = _components_fixture()
-    gr = dt.tl.endpoints(obj, obj, ["source"], ["sink"], cluster_key="clusters", graph="intr",
+    gr = dt.tl.endpoints(obj, ["source"], ["sink"], cluster_key="clusters", graph="intr",
                          p_end=0.5, sampling_mode=mode, verbose=0)
     info = gr["disconnected_info"]
     assert info["indices"] == [0, 5, 6, 7, 8, 9, 10, 11]
@@ -100,29 +100,15 @@ def test_largest_component_tie_goes_to_the_lowest_cell(mode):
     assert set(gr["source_indices"]) | set(gr["sink_indices"]) <= comps[0]
 
 
-def test_blocked_flows_bias_matches_a_per_edge_check(toy):
-    # adata_clust misses some cells: they have no label, and match no blocked pair
-    clust = toy[np.arange(toy.n_obs) % 10 != 3].copy()
-    blocked = [("sink", "mid"), ("mid", "source"), ("source", "source"), ("nope", "sink")]
-    gr = dt.tl.endpoints(toy, clust, ["source"], ["sink"], cluster_key="clusters", graph="intr",
-                         p_end=0.05, blocked_flows=blocked, verbose=0)
-    name_to_idx = gr["G"].graph["name_to_idx"]
-    lab = {name_to_idx[nm]: str(c) for nm, c in clust.obs["clusters"].items()}
-    expect = np.array(
-        [1.0 if (lab.get(u), lab.get(v)) in set(blocked) else d["cost"]
-         for u, v, d in gr["G"].to_networkx().edges(data=True)], dtype=np.float64)
-    assert (expect == 1.0).any() and (expect != 1.0).any()
-    assert gr["cost_vec"].tobytes() == expect.tobytes()
-
 
 def test_qrot_solves_the_same_problem_on_either_graph(toy):
     """qrot's CellGraph branch and its networkx branch must write identical results."""
     a_cg, a_nx = toy.copy(), toy.copy()
-    gr = dt.tl.endpoints(a_cg, a_cg, ["source"], ["sink"], cluster_key="clusters", graph="intr",
+    gr = dt.tl.endpoints(a_cg, ["source"], ["sink"], cluster_key="clusters", graph="intr",
                          p_end=0.05, sampling_mode="directed", seed=0, verbose=0)
     gr_nx = dict(gr, G=gr["G"].to_networkx())
-    dt.tl.qrot(gr, adata_basis=a_cg, adata_clust=a_cg, graph="intr", verbose=0)
-    dt.tl.qrot(gr_nx, adata_basis=a_nx, adata_clust=a_nx, graph="intr", verbose=0)
+    dt.tl.qrot(gr, adata=a_cg, graph="intr", verbose=0)
+    dt.tl.qrot(gr_nx, adata=a_nx, graph="intr", verbose=0)
     for key in ("pseudotime_raw", "pseudotime"):
         x, y = a_cg.obs[key].to_numpy(), a_nx.obs[key].to_numpy()
         assert x.dtype == y.dtype and x.tobytes() == y.tobytes(), key
@@ -136,7 +122,7 @@ def test_to_networkx_is_frozen_when_endpoints_runs(toy):
     place afterwards could not reach it. to_networkx() must not see such an edit either,
     or pl.endpoints' fallback layout would draw a graph qrot never solved over."""
     a = toy.copy()
-    gr = dt.tl.endpoints(a, a, ["source"], ["sink"], cluster_key="clusters", graph="intr",
+    gr = dt.tl.endpoints(a, ["source"], ["sink"], cluster_key="clusters", graph="intr",
                          p_end=0.05, verbose=0)
     before = _edges_with_data(gr["G"].to_networkx())
     a.obsp["neighbors_intr_distances"].data *= 2.0
@@ -152,7 +138,7 @@ def test_graph_survives_deepcopy_and_pickle_on_a_view(toy):
     matrix into its parent's whole obsp, which to_networkx() cannot read."""
     view = toy[np.arange(toy.n_obs) % 7 != 0]
     assert view.is_view
-    gr = dt.tl.endpoints(view, view, ["source"], ["sink"], cluster_key="clusters",
+    gr = dt.tl.endpoints(view, ["source"], ["sink"], cluster_key="clusters",
                          graph="intr", p_end=0.05, verbose=0)
     expect = _edges_with_data(_build_digraph(view, graph="intr"))
     assert _edges_with_data(gr["G"].to_networkx()) == expect
@@ -166,7 +152,7 @@ def test_networkx_style_access_raises_and_names_the_fix(toy):
     """endpoints()['G'] is no longer a networkx.DiGraph. A networkx idiom must raise and
     point at to_networkx(), not run on an array: `(u, v) in G.edges` on the (m, 2) edge
     array was true for nearly any pair."""
-    G = dt.tl.endpoints(toy, toy, ["source"], ["sink"], cluster_key="clusters", graph="intr",
+    G = dt.tl.endpoints(toy, ["source"], ["sink"], cluster_key="clusters", graph="intr",
                         p_end=0.05, verbose=0)["G"]
     assert isinstance(G, dt.tl.CellGraph) and "CellGraph" in dt.tl.__all__
     for name, hint in (("edges", True), ("nodes", True), ("to_undirected", True),
@@ -180,7 +166,7 @@ def test_networkx_style_access_raises_and_names_the_fix(toy):
 def test_a_2d_demand_fails_the_same_way_on_either_graph(toy, shape):
     """qrot checks f's shape before either graph path, so a demand of the wrong shape
     raises the same error on both."""
-    gr = dt.tl.endpoints(toy, toy, ["source"], ["sink"], cluster_key="clusters", graph="intr",
+    gr = dt.tl.endpoints(toy, ["source"], ["sink"], cluster_key="clusters", graph="intr",
                          p_end=0.05, verbose=0)
     bad = gr["f"].reshape(shape)
     msgs = []

@@ -255,7 +255,7 @@ def test_trajectory_rejects_n_lineages_with_sinks_before_solving():
 def graphed():
     # marker_noise=0 as in test_source_only: expression is monotone in t, so no mass flows
     # back into the source and the ranking is the clean sink-vs-mid comparison.
-    return dt.pp.graphs(*line_toy(n=150, marker_noise=0.0),
+    return dt.pp.integrate(*line_toy(n=150, marker_noise=0.0),
                         alpha=0.9, p_keep=0.3, verbose=False)
 
 

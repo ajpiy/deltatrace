@@ -177,7 +177,7 @@ def axolotl_object():
 @pytest.fixture(scope="module")
 def toy_graph():
     """The toy system's integrated graph. Clusters source/mid/sink, 50 cells each."""
-    return dt.pp.graphs(*line_toy(n=150), verbose=0)
+    return dt.pp.integrate(*line_toy(n=150), verbose=0)
 
 
 def _quotas(obj, source_clusters, sink_clusters, **kw):
@@ -201,7 +201,7 @@ def _quotas(obj, source_clusters, sink_clusters, **kw):
     kw.setdefault("p_basis", "cluster")
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        gr = dt.tl.endpoints(obj, obj, source_clusters, sink_clusters,
+        gr = dt.tl.endpoints(obj, source_clusters, sink_clusters,
                              cluster_key="clusters", graph="intr", verbose=2, **kw)
     out = []
     for want in ("Source quotas:", "Sink quotas:"):
@@ -238,7 +238,7 @@ def test_alloc_power_one_is_the_historical_cluster_allocation(pool_object, mode,
     for seed in SEEDS:
         want_src, want_snk = table[seed]
         for k in (1.0, 1):  # a float and the int, which must be accepted and identical
-            gr = dt.tl.endpoints(pool_object, pool_object, ["A", "B"], ["C", "D", "rare"],
+            gr = dt.tl.endpoints(pool_object, ["A", "B"], ["C", "D", "rare"],
                                  cluster_key="clusters", graph="intr", p_end=0.10,
                                  sampling_mode=mode, seed=seed, verbose=0,
                                  p_basis="cluster", alloc_power=k)
@@ -256,9 +256,9 @@ def test_default_alloc_power_is_proportional(pool_object):
     for seed in SEEDS:
         common = dict(cluster_key="clusters", graph="intr", p_end=0.10,
                       sampling_mode="directed", seed=seed, verbose=0, p_basis="cluster")
-        a = dt.tl.endpoints(pool_object, pool_object, ["A", "B"], ["C", "D", "rare"],
+        a = dt.tl.endpoints(pool_object, ["A", "B"], ["C", "D", "rare"],
                             **common)
-        b = dt.tl.endpoints(pool_object, pool_object, ["A", "B"], ["C", "D", "rare"],
+        b = dt.tl.endpoints(pool_object, ["A", "B"], ["C", "D", "rare"],
                             alloc_power=1.0, **common)
         assert list(a["source_indices"]) == list(b["source_indices"])
         assert list(a["sink_indices"]) == list(b["sink_indices"])
@@ -429,7 +429,7 @@ def test_largest_and_smallest_move_monotonically_with_alloc_power(clamp_object):
 def test_alloc_power_outside_the_unit_range_raises(pool_object, bad):
     """Only [0, 1] is meaningful; the message names the range and what its ends mean."""
     with pytest.raises(ValueError) as e:
-        dt.tl.endpoints(pool_object, pool_object, ["A", "B"], ["C"], cluster_key="clusters",
+        dt.tl.endpoints(pool_object, ["A", "B"], ["C"], cluster_key="clusters",
                         graph="intr", p_end=0.10, verbose=0, p_basis="cluster",
                         alloc_power=bad)
     msg = str(e.value)
@@ -442,7 +442,7 @@ def test_alloc_power_outside_the_unit_range_raises(pool_object, bad):
 def test_alloc_power_non_numeric_raises(pool_object, bad):
     """A non-number is a caller error, bools included: True is not an exponent."""
     with pytest.raises(ValueError) as e:
-        dt.tl.endpoints(pool_object, pool_object, ["A", "B"], ["C"], cluster_key="clusters",
+        dt.tl.endpoints(pool_object, ["A", "B"], ["C"], cluster_key="clusters",
                         graph="intr", p_end=0.10, verbose=0, p_basis="cluster",
                         alloc_power=bad)
     msg = str(e.value)
@@ -462,14 +462,14 @@ def test_bad_alloc_power_is_rejected_before_any_work(pool_object, monkeypatch):
 
     monkeypatch.setattr(_endpoints, "_build_cell_graph", boom)
     with pytest.raises(ValueError, match="alloc_power"):
-        dt.tl.endpoints(pool_object, pool_object, ["A"], ["C"], cluster_key="clusters",
+        dt.tl.endpoints(pool_object, ["A"], ["C"], cluster_key="clusters",
                         graph="intr", verbose=0, p_basis="cluster", alloc_power=3.0)
     assert not calls
 
     # Without this the test passes vacuously: the patched builder must be the one
     # endpoints actually calls, so a valid alloc_power has to run straight into it.
     with pytest.raises(AssertionError, match="graph was already built"):
-        dt.tl.endpoints(pool_object, pool_object, ["A"], ["C"], cluster_key="clusters",
+        dt.tl.endpoints(pool_object, ["A"], ["C"], cluster_key="clusters",
                         graph="intr", verbose=0, p_basis="cluster", alloc_power=0.5)
     assert len(calls) == 1
 
@@ -483,10 +483,10 @@ def test_alloc_power_is_inert_under_the_lcc_basis(toy_graph):
     for seed in (0, 42, 2024):
         common = dict(cluster_key="clusters", graph="intr", p_end=0.05,
                       sampling_mode="directed", seed=seed, verbose=0, p_basis="lcc")
-        base = dt.tl.endpoints(toy_graph, toy_graph, ["source", "mid"], ["mid", "sink"],
+        base = dt.tl.endpoints(toy_graph, ["source", "mid"], ["mid", "sink"],
                                **common)
         for k in (0.0, 0.25, 0.5, 1.0):
-            got = dt.tl.endpoints(toy_graph, toy_graph, ["source", "mid"], ["mid", "sink"],
+            got = dt.tl.endpoints(toy_graph, ["source", "mid"], ["mid", "sink"],
                                   alloc_power=k, **common)
             assert list(got["source_indices"]) == list(base["source_indices"]), f"k={k}"
             assert list(got["sink_indices"]) == list(base["sink_indices"]), f"k={k}"

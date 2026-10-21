@@ -23,7 +23,7 @@ Quick Start
 >>> adata, adata_dist = dt.datasets.crypt()
 >>>
 >>> # expression + intersection graphs, merged into one object
->>> ad_intg = dt.pp.graphs(adata, adata_dist)
+>>> ad_intg = dt.pp.integrate(adata, adata_dist)
 building the 'expr' graph ... finished (...)
 building the 'intr' graph ... finished (...)
 done.

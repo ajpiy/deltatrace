@@ -91,7 +91,7 @@ def test_cells_are_not_stored_wall_by_wall():
 @pytest.mark.parametrize(("n", "seed"), [(n, s) for n in (80, 150) for s in range(5)] + [(1000, 7)])
 def test_intr_is_one_component_and_the_lumen_is_cut(n, seed):
     adata, adata_dist = dt.datasets.crypt(n=n, seed=seed)
-    g = dt.pp.graphs(adata, adata_dist, p_keep=P_KEEP, verbose=0)
+    g = dt.pp.integrate(adata, adata_dist, p_keep=P_KEEP, verbose=0)
     ncomp, _ = _intr_components(g)
     assert ncomp == 1
     with contextlib.redirect_stdout(io.StringIO()):
@@ -113,9 +113,9 @@ def test_expression_alone_cannot_tell_the_walls_apart():
 
 def test_the_rungs_come_back_above_p_keep_0_4():
     adata, adata_dist = dt.datasets.crypt(n=150)
-    assert _rungs(dt.pp.graphs(adata, adata_dist, p_keep=P_KEEP, verbose=0), adata) == 0
-    assert _rungs(dt.pp.graphs(adata, adata_dist, verbose=0), adata) == 0      # the default 0.3 cuts them too
-    assert _rungs(dt.pp.graphs(adata, adata_dist, p_keep=0.45, verbose=0), adata) > 0
+    assert _rungs(dt.pp.integrate(adata, adata_dist, p_keep=P_KEEP, verbose=0), adata) == 0
+    assert _rungs(dt.pp.integrate(adata, adata_dist, verbose=0), adata) == 0      # the default 0.3 cuts them too
+    assert _rungs(dt.pp.integrate(adata, adata_dist, p_keep=0.45, verbose=0), adata) > 0
 
 
 def test_false_fate_is_cut_off_as_its_own_component():
@@ -124,7 +124,7 @@ def test_false_fate_is_cut_off_as_its_own_component():
     assert false.sum() >= 3
     assert adata.uns["story"]["decoy_clusters"] == ["false_fate"]
     assert np.isnan(adata.obs["true_time"].to_numpy()[false]).all()
-    g = dt.pp.graphs(adata, adata_dist, p_keep=P_KEEP, verbose=0)
+    g = dt.pp.integrate(adata, adata_dist, p_keep=P_KEEP, verbose=0)
     _, comp = _intr_components(g)
     main = np.argmax(np.bincount(comp))
     np.testing.assert_array_equal(comp != main, false)

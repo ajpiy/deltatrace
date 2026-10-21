@@ -52,7 +52,7 @@ Use `uv sync` instead for development checkout.
 import deltatrace as dt
 
 # builds the expression and spatially integrated graphs into one object
-ad_intg = dt.pp.graphs(adata, adata_dist)
+ad_intg = dt.pp.integrate(adata, adata_dist)
 
 # runs: endpoints -> qrot -> velocity -> lineages on the intersection graph (intr)
 # sources / sinks: lists of progenitor and terminal cluster labels
@@ -77,7 +77,7 @@ res["pseudotime"]    # (n,) in [0, 1], NaN where a node has no potential
 res["flow"]          # (n, n) sparse array of the optimal flow
 ```
 
-The default `tau=100` is set for masses that total 1; costs are divided by the largest first.
+`qrot_graph`'s default `tau=100` is set for masses that total 1, and costs are divided by the largest first; `tau="auto"` (the default of `tl.qrot`) takes 0.3 times the nodes in the largest connected piece.
 -->
 
 ## Public API
@@ -86,7 +86,7 @@ The default `tau=100` is set for masses that total 1; costs are divided by the l
 
 | Namespace | Functions |
 |-----------|-----------|
-| `dt.pp` (preprocess) | `wasserstein`, `integrate`, `graphs` |
+| `dt.pp` (preprocess) | `wasserstein`, `integrate` |
 | `dt.tl` (tool) | `trajectory`, `endpoints`, `qrot`, `qrot_graph`, `compute_velocity_grid`, `lineages`, `terminality`, `widest_path`, `cluster_trajectory` |
 | `dt.pl` (plot) | `pseudotime`, `velocity`, `endpoints`, `lineages`, `cluster_trajectory` |
 | `dt.datasets` | `crypt` |

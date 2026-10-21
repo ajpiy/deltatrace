@@ -1,7 +1,7 @@
 """Synthetic datasets (``deltatrace.datasets``): the example system for docs and tutorials.
 
 Holds :func:`crypt`, which hands back a ready-to-use pair of objects for the
-:func:`deltatrace.pp.graphs` entry point, synthesized deterministically from ``seed``: a
+:func:`deltatrace.pp.integrate` entry point, synthesized deterministically from ``seed``: a
 crypt-shaped tissue whose two walls run the same program, so that tissue distance changes
 the answer.
 """
@@ -61,12 +61,12 @@ def crypt(
     wall). Which top a transit cell reaches is set by its wall, which expression cannot
     see below the fork and the tissue can. The returned expression object already
     carries a PCA and a kNN graph, so it can go straight into
-    :func:`deltatrace.pp.graphs`, with ``["progenitor"]`` as the source and
+    :func:`deltatrace.pp.integrate`, with ``["progenitor"]`` as the source and
     ``["fate_A", "fate_B"]`` as the sinks.
 
     The expression kNN graph is a ladder: besides the links along each wall, it has
     rungs straight across the lumen between cells of the same stage. The example uses
-    ``p_keep=0.32`` in :func:`deltatrace.pp.graphs`: with the default geometry the tissue
+    ``p_keep=0.32`` in :func:`deltatrace.pp.integrate`: with the default geometry the tissue
     radius comes out near 4 units, shorter than the 5-unit lumen, so the intersection
     graph (``"intr"``) cuts every rung. The walls stay joined through the base, which is
     one continuous stretch of tissue whose cells are alike in expression, so ``"intr"``
@@ -83,7 +83,7 @@ def crypt(
         Number of cells, at least 40. They are split evenly between the two walls and
         spread evenly, with jitter, along each. ``150`` keeps the tests fast and the
         quickstart uses ``300``; ``1000`` gives a dense picture and still runs through
-        :func:`deltatrace.pp.graphs` and :func:`deltatrace.tl.trajectory` in under a
+        :func:`deltatrace.pp.integrate` and :func:`deltatrace.tl.trajectory` in under a
         second.
     seed : int, default 15
         Seed for the placement jitter, the expression noise and the cell order. Every
@@ -136,7 +136,7 @@ def crypt(
         order.
     adata_dist : anndata.AnnData
         Dense ``(n, n)`` pairwise tissue distance matrix, in the shape
-        :func:`deltatrace.pp.graphs` expects for its ``adata_dist`` argument, with both
+        :func:`deltatrace.pp.integrate` expects for its ``adata_dist`` argument, with both
         axes labeled by ``adata.obs_names``.
 
     Notes
@@ -151,7 +151,7 @@ def crypt(
     about 7 units wide and 10.5 tall. That size keeps
     the velocity arrows of :func:`deltatrace.pl.pseudotime`, which are drawn in data
     units, at a legible length. Scaling every length together changes no result,
-    because :func:`deltatrace.pp.graphs` sets its radius as a quantile of all pairwise
+    because :func:`deltatrace.pp.integrate` sets its radius as a quantile of all pairwise
     distances. Changing one length does: the radius is a quantile over the whole tissue,
     so taller walls, a narrower lumen or thicker walls can push the ``p_keep=0.32``
     radius past the lumen and bring the rungs back (``wall_height=11`` or
@@ -163,7 +163,7 @@ def crypt(
     (``tau`` in :func:`deltatrace.tl.trajectory`) magnifies small differences between
     the two walls' links. The clocks therefore drift apart, so cells at the same height
     on opposite walls get different pseudotime: by about 0.06 on average at ``n=150``
-    and 0.03 at ``n=1000``. The expression graph mixes the walls, so they share one
+    and 0.03 at ``n=1000`` (figures here measured at ``tau=100``, the default before 0.3.0). The expression graph mixes the walls, so they share one
     clock. Read on one clock across both walls, DeltaTrace therefore loses a little at
     small ``n`` (Spearman with ``t`` about 0.96 against 0.99 at ``n=150``) and nearly
     ties at ``n=1000``.
@@ -179,6 +179,15 @@ def crypt(
     some draws from about ``n=600``, the very bottom of the base does so on both graphs:
     the source cells are centered on the progenitor cluster's best-connected cells, which
     sit on the flanks of the base, so the bottom of the U lies behind them.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt(n=150, seed=42)
+    >>> adata.shape
+    (150, 8)
+    >>> "spatial" in adata.obsm
+    True
     """
     import scanpy as sc
 

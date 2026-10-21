@@ -18,10 +18,35 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
-from ._utils import _PKG_DIR, CellGraph, _renamed_kwargs, _resolve_basis, _resolve_graph, _suffix
+from ._utils import _PKG_DIR, CellGraph, _resolve_basis, _resolve_graph, _suffix
 
 __all__ = ["pseudotime", "velocity", "endpoints", "lineages",
            "cluster_trajectory"]
+
+
+class _PlotResult(tuple):
+    """A (fig, ax) tuple that forwards attribute access to `ax` for Scanpy compatibility.
+
+    Supports unpacking: `fig, ax = dt.pl.pseudotime(...)`.
+    Also allows calling axis methods directly: `dt.pl.pseudotime(...).set_title(...)`.
+    """
+
+    def __new__(cls, fig, ax):
+        return super().__new__(cls, (fig, ax))
+
+    def __getnewargs__(self):
+        return tuple(self)
+
+    @property
+    def fig(self):
+        return self[0]
+
+    @property
+    def ax(self):
+        return self[1]
+
+    def __getattr__(self, name):
+        return getattr(self[1], name)
 
 
 def _root_fig(ax):
@@ -101,9 +126,10 @@ def _scatter_values(ax, coords, values, *, cmap, vmin, vmax, size, na_color, zor
                    zorder=zorder - 0.5, **kwargs)
         return None
     o = np.argsort(finite, kind="stable")                 # non-finite first
+    s = np.asarray(size)[o] if np.ndim(size) > 0 else size
     return ax.scatter(coords[o, 0], coords[o, 1], c=values[o],
                       cmap=mpl.colormaps.get_cmap(cmap).with_extremes(bad=na_color),
-                      vmin=vmin, vmax=vmax, s=size, edgecolors="none", zorder=zorder,
+                      vmin=vmin, vmax=vmax, s=s, edgecolors="none", zorder=zorder,
                       plotnonfinite=True, **kwargs)
 
 
@@ -163,56 +189,66 @@ def velocity(
     save: str | None = None,
     show: bool = False,
 ) -> tuple:
-    """Draw the velocity field on an axes -- yours, scanpy's, or a new one.
+    """Draw the velocity vector field on a matplotlib axes.
 
-    This is the arrow layer of :func:`pseudotime`, on its own, so it can go on top of
-    any scatter of the same embedding::
-
-        ax = sc.pl.embedding(adata, basis="spatial", color="pseudotime", show=False)
-        dt.pl.velocity(adata, ax=ax, kind="stream")
-
-    One trap: DeltaTrace reads ``obsm["X_<basis>"]`` before ``obsm["<basis>"]`` and
-    scanpy the other way round. If both keys exist with different values, pass scanpy
-    the key the grid used (``basis="X_spatial"``); a warning names it.
+    Renders the velocity field computed by :func:`deltatrace.tl.compute_velocity_grid`
+    as grid quivers, streamlines, or individual cell velocity vectors. Can be
+    overlaid onto an existing scatter plot (e.g. from `scanpy.pl.embedding`).
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Needs ``uns["dt_grid"]`` (:func:`deltatrace.tl.compute_velocity_grid`);
-        ``kind="raw"`` also needs ``uns["dt_raw_arrows"]``.
+        AnnData holding ``uns["dt_grid"]`` from :func:`deltatrace.tl.compute_velocity_grid`.
     basis : str, optional
-        Embedding the axes shows. The grid was computed in one embedding
-        (``uns["dt_grid"]["basis"]``) and is only meaningful there, so a different
-        ``basis`` is refused; ``None`` takes the grid's. Naming the ``X_`` key
-        explicitly (``basis="X_spatial"``) also silences the warning below.
+        Embedding basis to draw on. Must match the basis used for ``dt_grid``.
     ax : matplotlib.axes.Axes, optional
-        Axes to draw on; created if ``None``.
+        Target axes to draw on. Created if None.
     kind : {"quiver", "stream", "raw"}, default "quiver"
-        Grid quiver, streamlines, or one raw arrow per cell.
+        Style of velocity visualization: regular grid quiver arrows, continuous
+        streamlines, or individual cell vectors.
     coord_scale : float, default 1.0
-        Scale the scatter's coordinates were multiplied by; the arrows get the same.
-    arrow_scale, arrow_width : float
-        Quiver/raw arrow scaling and shaft width.
-    stream_density, stream_linewidth, stream_arrowsize : float
-        Streamplot parameters (``kind="stream"``).
+        Coordinate multiplier matching underlying scatter plot.
+    arrow_scale : float, default 1.0
+        Length multiplier for quiver/raw arrows.
+    arrow_width : float, default 0.005
+        Shaft width for quiver arrows.
+    stream_density : float, default 1.5
+        Density parameter for streamlines (when ``kind="stream"``).
+    stream_linewidth : float, default 1.0
+        Linewidth for streamlines.
+    stream_arrowsize : float, default 1.0
+        Arrowhead size for streamlines.
     raw_subsample : float or int, optional
-        For ``kind="raw"``: fraction (0-1) or count of arrows to keep.
+        Subsampling fraction or count for ``kind="raw"``.
     raw_seed : int, optional
-        RNG seed for raw subsampling.
-    color, alpha, zorder
-        Arrow styling.
+        RNG seed for raw arrow subsampling.
+    color : str, default "black"
+        Color of velocity arrows/streamlines.
+    alpha : float, default 0.9
+        Opacity of arrows.
+    zorder : float, default 4
+        Matplotlib drawing z-order.
     key_added : str, optional
-        Read the ``_<key_added>``-suffixed keys from a namespaced run.
+        Namespace suffix matching :func:`deltatrace.tl.qrot`.
     save : str, optional
-        Path to save the figure (300 dpi).
+        File path to save the figure.
     show : bool, default False
-        Call ``plt.show()``. Off by default: this is usually a layer on someone else's
-        figure.
+        Whether to call ``plt.show()``.
 
     Returns
     -------
     tuple or None
-        ``(fig, ax)`` with ``show=False``; ``None`` once the figure is shown.
+        ``(fig, ax)`` when ``show=False``; ``None`` when ``show=True``.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> dt.tl.qrot(gr, adata=adata)
+    >>> dt.tl.compute_velocity_grid(adata, basis="spatial")
+    >>> fig, ax = dt.pl.velocity(adata, basis="spatial", kind="quiver", show=False)
     """
     if kind not in ("quiver", "stream", "raw"):
         raise ValueError(f"kind must be 'quiver', 'stream' or 'raw'; got {kind!r}")
@@ -250,7 +286,7 @@ def velocity(
     if show:
         plt.show()
         return None
-    return fig, ax
+    return _PlotResult(fig, ax)
 
 
 # ---------------------------------------------------------------------------
@@ -285,66 +321,65 @@ def pseudotime(
     na_color: str = "lightgray",
     title: str | None = None,
 ) -> tuple:
-    """Scatter cells colored by pseudotime, with the velocity field drawn on top.
+    """Scatter cells colored by pseudotime, with velocity vector overlay.
 
-    Color is the pseudotime :func:`deltatrace.tl.qrot` writes, on ``[0, 1]`` by default,
-    so early cells sit at one end of ``cmap`` and terminal cells at the other. Arrows show
-    where the transport flows (:func:`velocity`): smoothed on a grid (``"quiver"``,
-    ``"stream"``) or one raw arrow per cell (``"raw"``). Cells without a pseudotime
-    (disconnected, when not reconnected) are drawn underneath in ``na_color``.
-
-    The same picture without arrows is one scanpy call,
-    ``sc.pl.embedding(adata, basis=..., color="pseudotime")``; add the arrows to it with
-    :func:`velocity`.
+    Plots cellular pseudotime on the specified coordinate embedding, optionally
+    drawing regular grid quivers, streamlines, or raw cell velocity vectors.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Needs ``obs["pseudotime"]`` (:func:`deltatrace.tl.qrot`) and, unless
-        ``arrows="none"``, ``uns["dt_grid"]`` (:func:`deltatrace.tl.compute_velocity_grid`);
-        ``arrows="raw"`` also needs ``uns["dt_raw_arrows"]``.
+        AnnData holding ``obs["pseudotime"]`` (from :func:`deltatrace.tl.qrot`) and
+        optionally ``uns["dt_grid"]`` (from :func:`deltatrace.tl.compute_velocity_grid`).
     basis : str, optional
-        Embedding name; defaults to the basis stored in ``uns["dt_grid"]``.
+        Embedding coordinate name (e.g. ``"spatial"`` or ``"umap"``).
     coord_scale : float, default 1.0
-        Scale applied to coordinates and, to match, the arrows.
+        Coordinate multiplier.
     cmap : str, default "coolwarm"
         Colormap for pseudotime.
     arrows : {"quiver", "stream", "raw", "none"}, default "quiver"
-        Arrow style: grid quiver, streamlines, raw per-cell arrows, or none.
-    arrow_scale, arrow_width, stream_density, stream_linewidth, stream_arrowsize,
-    raw_subsample, raw_seed
-        Passed to :func:`velocity`.
+        Velocity arrow style: grid quiver, streamlines, raw cell vectors, or none.
+    arrow_scale, arrow_width, stream_density, stream_linewidth, stream_arrowsize, raw_subsample, raw_seed
+        Styling parameters forwarded to :func:`velocity`.
     node_size : float, optional
-        Marker area; defaults to scanpy's ``120000 / n_obs``.
+        Marker area for cell scatter points. Defaults to Scanpy's ``120000 / n_obs``.
     show_edges : bool, default False
-        Draw the flow's graph edges from ``uns["dt_grid"]["edges"]``.
+        Whether to draw flow graph edges underneath cells.
     edge_alpha, edge_width : float
-        Edge styling.
+        Styling for graph edges when ``show_edges=True``.
     ax : matplotlib.axes.Axes, optional
-        Target axes; created if ``None``.
+        Target axes to draw on.
     save : str, optional
-        Path to save the figure (300 dpi).
+        File path to save the figure.
     show : bool, default True
-        Call ``plt.show()``.
+        Whether to call ``plt.show()``.
     key_added : str, optional
-        Read the ``_<key_added>``-suffixed keys from a namespaced run.
+        Namespace suffix matching :func:`deltatrace.tl.qrot`.
     vmin, vmax : float or None, default 0.0, 1.0
-        Color limits, matching pseudotime's ``[0, 1]`` scale; ``None`` uses the data
-        range. Pass the same pair to several panels to put them on one scale.
+        Colormap limits for pseudotime.
     colorbar : bool, default True
-        Draw a colorbar next to the axes. Turn off to place one shared colorbar yourself
-        from the returned axes' first collection (``ax.collections[0]``).
+        Whether to draw a colorbar.
     colorbar_label : str, optional
-        Colorbar label (none by default).
+        Label for the colorbar.
     na_color : str, default "lightgray"
-        Color for cells with a non-finite pseudotime.
+        Color for cells without finite pseudotime.
     title : str, optional
         Axes title.
 
     Returns
     -------
     tuple or None
-        ``(fig, ax)`` with ``show=False``; ``None`` once the figure is shown.
+        ``(fig, ax)`` when ``show=False``; ``None`` when ``show=True``.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> dt.tl.qrot(gr, adata=adata)
+    >>> dt.tl.compute_velocity_grid(adata, basis="spatial")
+    >>> fig, ax = dt.pl.pseudotime(adata, basis="spatial", arrows="quiver", show=False)
     """
     if arrows not in ("quiver", "stream", "raw", "none"):
         raise ValueError(
@@ -395,7 +430,7 @@ def pseudotime(
     if show:
         plt.show()
         return None
-    return fig, ax
+    return _PlotResult(fig, ax)
 
 # ---------------------------------------------------------------------------
 # pl.endpoints
@@ -408,10 +443,9 @@ _OKABE_ITO = ("#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", 
               "#000000")
 
 
-@_renamed_kwargs(tag="graph")
 def endpoints(
-    graph_result: dict,
     adata,
+    graph_result: dict,
     basis: str | None = None,
     coord_scale: float = 1.0,
     graph: str | None = None,
@@ -430,57 +464,60 @@ def endpoints(
     *,
     legend: bool = True,
 ) -> tuple:
-    """Highlight the sampled source and sink cells on an embedding.
+    """Highlight sampled source and sink endpoint cells on an embedding.
 
-    Shows which cells :func:`deltatrace.tl.endpoints` actually drew as the emitters and
-    absorbers of the transport: they are drawn large and colored, every other cell small
-    and gray. Useful for checking that the sampling landed inside the intended clusters
-    before committing to a solve.
-
-    :func:`deltatrace.tl.endpoints` also records the same three classes in
-    ``obs["endpoint_<graph>"]``, so ``sc.pl.embedding(adata, color="endpoint_intr")`` draws
-    them with scanpy.
+    Draws sampled source (emitter) and sink (absorber) cells highlighted over
+    intermediate cells on the chosen 2D coordinate basis.
 
     Parameters
     ----------
-    graph_result : dict
-        Output of :func:`deltatrace.tl.endpoints` (``"G"``, ``"source_indices"``,
-        ``"sink_indices"``).
     adata : anndata.AnnData
-        Object with the embedding for ``basis`` (``n_obs`` cells). Not modified.
+        AnnData containing coordinates in `obsm[basis]`.
+    graph_result : dict
+        Flow problem dictionary from :func:`deltatrace.tl.endpoints`.
     basis : str, optional
-        Embedding name. ``None`` takes the last velocity grid's embedding, else
-        ``obsm['spatial']``, else ``X_umap``. Without one the graph is laid out with a
-        spring layout instead (slow on large data), with a warning.
+        Embedding basis to plot (e.g. ``"spatial"`` or ``"umap"``).
     coord_scale : float, default 1.0
-        Coordinate scale applied to background cells, endpoints and edges alike.
+        Coordinate multiplier.
     graph : str, optional
-        Name of the graph the endpoints were sampled on, for the title; ``None`` reads it
-        from ``graph_result``.
-    source_color, sink_color, bg_color : str
-        Colors for source, sink and intermediate cells.
-    node_size_endpoint, node_size_other : float
-        Marker areas for endpoints vs other cells; ``node_size_other=None`` uses
-        scanpy's ``120000 / n_obs``.
+        Graph name to display in title. Auto-detected if None.
+    source_color : str, default "#3B4CC0"
+        Color for source cells.
+    sink_color : str, default "#B40426"
+        Color for sink cells.
+    bg_color : str, default "lightgray"
+        Color for intermediate background cells.
+    node_size_endpoint : float, default 60
+        Marker area for source/sink endpoint cells.
+    node_size_other : float or None, default 10
+        Marker area for intermediate cells. None uses ``120000 / n_obs``.
     show_edges : bool, default True
-        Draw graph edges.
+        Whether to draw graph edges between cells.
     edge_alpha, edge_width : float
-        Edge styling.
+        Edge styling parameters.
     title : str, optional
-        Plot title; defaults to ``"Endpoints: <graph>"``.
+        Plot title. Defaults to ``"Endpoints: <graph>"``.
     save : str, optional
-        Path to save the figure.
+        File path to save the figure.
     show : bool, default True
-        Call ``plt.show()``.
+        Whether to call ``plt.show()``.
     ax : matplotlib.axes.Axes, optional
-        Target axes.
+        Target axes to draw on.
     legend : bool, default True
-        Draw the source / intermediate / sink legend.
+        Whether to show the class legend.
 
     Returns
     -------
     tuple or None
-        ``(fig, ax)`` with ``show=False``; ``None`` once the figure is shown.
+        ``(fig, ax)`` when ``show=False``; ``None`` when ``show=True``.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> fig, ax = dt.pl.endpoints(adata, gr, basis="spatial", show=False)
     """
     from matplotlib.lines import Line2D
 
@@ -563,7 +600,7 @@ def endpoints(
     if show:
         plt.show()
         return None
-    return fig, ax
+    return _PlotResult(fig, ax)
 
 # ---------------------------------------------------------------------------
 # pl.lineages
@@ -586,57 +623,62 @@ def lineages(
     save: str | None = None,
     show: bool = True,
 ) -> tuple:
-    """Scatter cells colored by the terminal fate they are committed to.
+    """Scatter cells colored by their committed terminal lineage.
 
-    Plots what :func:`deltatrace.tl.lineages` writes: ``obs["lineage"]``, the argmax fate
-    of the absorbing chain, colored per terminal, with ``obs["lineage_confidence"]``
-    optionally driving opacity so bipotent cells read as faint and committed cells as
-    solid. Cells reaching no declared terminal are ``"unassigned"`` and drawn underneath
-    in ``unassigned_color``. For one fate's probability instead, color by its
-    ``obs["fate_<lineage>"]`` column (``/`` in the name written as ``_``) with scanpy.
+    Colors cells by assigned terminal fate (``obs["lineage"]``), with marker opacity
+    scaled by lineage confidence (``obs["lineage_confidence"]``) so multipotent or
+    transitional cells appear faint and committed cells appear solid.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Needs ``obs["lineage"]``, ``obs["lineage_confidence"]`` and
+        AnnData holding ``obs["lineage"]``, ``obs["lineage_confidence"]`` and
         ``uns["path_lineages"]`` from :func:`deltatrace.tl.lineages`.
     basis : str, optional
-        Embedding name; defaults to the basis recorded in ``uns["dt_grid"]``.
+        Embedding coordinate name. Defaults to the basis in ``uns["dt_grid"]``.
     lineage_colors : dict, optional
-        ``{lineage_name: color}``. Names left out fall back to ``cmap``; an unknown name
-        raises rather than being silently ignored.
+        Explicit mapping of ``{lineage_name: color}``.
     key_added : str, optional
-        Read the ``_<key_added>``-suffixed keys written by a namespaced run.
+        Namespace suffix matching :func:`deltatrace.tl.lineages`.
     cmap : str, default "okabe_ito"
-        Colors for lineages not named in ``lineage_colors``: the colorblind-safe
-        Okabe-Ito palette (up to 8 lineages, else ``tab20``), or any matplotlib colormap.
-        A listed colormap repeats its colors when there are more lineages than colors.
+        Colormap or palette name for lineage colors (defaults to Okabe-Ito).
     unassigned_color : str, default "lightgray"
-        Color for cells reaching no declared terminal.
+        Color for cells not reaching any terminal fate.
     confidence_alpha : bool, default True
-        Scale opacity by ``obs["lineage_confidence"]`` across ``alpha_range``.
-    alpha_range : tuple, default (0.25, 1.0)
-        Opacity at minimum and maximum confidence.
+        Whether to modulate marker alpha by lineage confidence.
+    alpha_range : tuple of float, default (0.25, 1.0)
+        Minimum and maximum alpha when confidence modulation is active.
     coord_scale : float, default 1.0
-        Multiplicative scale applied to coordinates.
-    node_size, unassigned_size : float, optional
-        Marker areas for assigned and unassigned cells; ``node_size`` defaults to
-        scanpy's ``120000 / n_obs``, ``unassigned_size`` to ``node_size``.
+        Coordinate multiplier.
+    node_size : float, optional
+        Marker area for assigned cells. Defaults to ``120000 / n_obs``.
+    unassigned_size : float, optional
+        Marker area for unassigned cells.
     legend : bool, default True
-        Draw a legend, one entry per lineage plus ``"unassigned"`` when present.
+        Whether to show the lineage color legend.
     title : str, optional
-        Plot title.
+        Axes title.
     ax : matplotlib.axes.Axes, optional
-        Target axes; created if ``None``.
+        Target axes to draw on.
     save : str, optional
-        Path to save the figure (300 dpi).
+        File path to save the figure.
     show : bool, default True
-        Call ``plt.show()``.
+        Whether to call ``plt.show()``.
 
     Returns
     -------
     tuple or None
-        ``(fig, ax)`` with ``show=False``; ``None`` once the figure is shown.
+        ``(fig, ax)`` when ``show=False``; ``None`` when ``show=True``.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> dt.tl.qrot(gr, adata=adata)
+    >>> lin = dt.tl.lineages(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> fig, ax = dt.pl.lineages(adata, basis="spatial", show=False)
     """
     sfx = _suffix(key_added)
     lin_key, conf_key = f"lineage{sfx}", f"lineage_confidence{sfx}"
@@ -735,7 +777,7 @@ def lineages(
     if show:
         plt.show()
         return None
-    return fig, ax
+    return _PlotResult(fig, ax)
 
 
 # ---------------------------------------------------------------------------
@@ -818,62 +860,63 @@ def cluster_trajectory(
     show: bool = True,
     ax=None,
 ) -> tuple:
-    """Draw the flow's own cluster graph, directed by net transport.
+    """Draw the coarse-grained cluster trajectory graph directed by net transport.
 
-    One node per cluster, placed at its median position in ``basis`` and sized by the mass
-    passing through it, plus one arrow per retained edge, widened by the net flux it
-    carries and pointing the way the mass actually moves. Node color is the cluster's
-    median pseudotime. Edges, weights and directions all come from the flow itself rather
-    than from neighbor-graph connectivity.
+    Renders clusters as nodes sized by transported mass and colored by median
+    pseudotime, with directed arrows weighted by net inter-cluster transport flux.
+    Nodes can be positioned using cell embedding coordinates (`basis`) or an
+    abstract graph layout algorithm (`layout`).
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Needs ``uns["dt_cluster_trajectory"]`` (:func:`deltatrace.tl.cluster_trajectory`),
-        the cluster labels in ``obs[cluster_key]``, and the embedding for ``basis``.
+        AnnData holding ``uns["dt_cluster_trajectory"]`` from :func:`deltatrace.tl.cluster_trajectory`.
     basis : str, optional
-        Embedding name; defaults to the basis recorded in ``uns["dt_grid"]``.
+        Embedding name for node positions (defaults to the basis in ``uns["dt_grid"]``).
     cluster_key : str, default "clusters"
-        ``obs`` column with the cluster labels; must be the column the graph was computed
-        on (checked, and refused otherwise).
+        Column in ``adata.obs`` with cluster labels matching the cluster graph.
     key_added : str, optional
-        Namespace of the run to draw, matching :func:`deltatrace.tl.cluster_trajectory`.
+        Namespace suffix matching :func:`deltatrace.tl.cluster_trajectory`.
     cmap : str, default "coolwarm"
-        Colormap for the per-cluster median pseudotime.
+        Colormap for cluster median pseudotime.
     edge_lw_range, node_size_range : tuple of float
-        Edge line-width and node-size ranges; an all-equal input lands at the midpoint
-        rather than at the floor.
+        Display ranges for edge linewidths and node marker sizes.
     arrow_size : float, default 0.04
-        Midpoint arrow half-length as a fraction of edge length.
-    layout : str, optional
-        Position nodes from the cluster GRAPH instead of an embedding:
-        ``"kamada_kawai"``, ``"spring"`` (= ``"fr"``, Fruchterman-Reingold),
-        ``"forceatlas2"``, ``"spectral"``, ``"circular"``, ``"planar"``, ``"shell"``,
-        or ``"pseudotime"`` (x = cluster pseudotime, y from Kamada-Kawai).
-        ``basis`` is then unused.
-    layout_seed : int, default 0
-        Seed for the layouts that take one (``spring``, ``forceatlas2``). Small graphs
-        move a lot between seeds; pin whichever you use.
-    layout_kwds : dict, optional
-        Extra keywords for the networkx layout, e.g. ``{"k": 1.5, "iterations": 200}``
-        for ``spring`` -- ``k`` is the target node spacing.
+        Arrowhead size relative to edge length.
     node_pad : float, default 0.15
-        Axis padding fraction around node positions.
+        Axis padding fraction around nodes.
     flag_flipped : bool, default True
-        Dash the edges the acyclicity guard reversed.
+        Whether to draw dashed lines for edges flipped by the acyclicity guard.
+    layout : str, optional
+        Abstract network layout instead of embedding coordinates (e.g. ``"kamada_kawai"``,
+        ``"spring"``, or ``"pseudotime"``).
+    layout_seed : int, default 0
+        Random seed for stochastic graph layouts.
+    layout_kwds : dict, optional
+        Additional keyword arguments passed to the networkx layout function.
     title : str, optional
         Plot title.
     save : str, optional
-        Path to save the figure.
+        File path to save the figure.
     show : bool, default True
-        Call ``plt.show()``.
+        Whether to call ``plt.show()``.
     ax : matplotlib.axes.Axes, optional
-        Target axes.
+        Target axes to draw on.
 
     Returns
     -------
     tuple or None
-        ``(fig, ax)`` with ``show=False``; ``None`` once the figure is shown.
+        ``(fig, ax)`` when ``show=False``; ``None`` when ``show=True``.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> dt.tl.qrot(gr, adata=adata)
+    >>> dt.tl.cluster_trajectory(adata)
+    >>> fig, ax = dt.pl.cluster_trajectory(adata, basis="spatial", show=False)
     """
     import matplotlib.colors as mcolors
 
@@ -1023,4 +1066,4 @@ def cluster_trajectory(
     if show:
         plt.show()
         return None
-    return fig, ax
+    return _PlotResult(fig, ax)

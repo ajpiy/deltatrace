@@ -16,7 +16,6 @@ from ._utils import (
     _as_labels,
     _build_cell_graph,
     _check_labels,
-    _renamed_kwargs,
     _resolve_graph,
 )
 
@@ -32,101 +31,101 @@ def _cluster_rng(seed, role, cluster) -> _random.Random:
     return _random.Random(int.from_bytes(hashlib.sha256(key).digest()[:8], "big"))
 
 
-@_renamed_kwargs(tag="graph")
 @_log.stage("sampling source and sink endpoints")
 def endpoints(
-    adata_basis,
-    adata_clust,
+    adata,
     source_clusters,
-    sink_clusters,
+    sink_clusters=None,
     p_end: float = 0.15,
+    *,
+    p_basis: str = "cluster",
+    alloc_power: float = 1.0,
     sampling_mode: str | dict[str, str] = "centered",
+    directed_metric: str = "cost",
     cluster_key: str = "clusters",
     graph: str | None = None,
     seed: int = 42,
-    blocked_flows: list[tuple[str, str]] | None = None,
     sink_weights: str = "uniform",
     verbose: int | bool = 1,
-    *,
-    directed_metric: str = "cost",
-    p_basis: str = "cluster",
-    alloc_power: float = 1.0,
 ) -> dict:
-    """Sample source and sink cells and build the flow demand vector for QROT.
+    """Sample source and sink cells and construct the flow demand vector for QROT.
 
-    Builds a bidirectional cell graph from the integrated graph, keeps its largest
-    connected component (LCC), and samples ``p_end`` of either the LCC or of
-    each cluster (see ``p_basis``) from the given source and sink clusters. Those
-    cells define the balanced demand ``f[source] = -1/n_source`` and ``f[sink] =
-    +1/n_sink``, which :func:`qrot` then transports along the graph.
+    Extracts the largest connected component (LCC) of the specified graph,
+    samples representative cells from declared source and sink clusters according
+    to `p_end` and `p_basis`, and sets up the balanced flow demand:
+
+        f[source] = -1 / n_source
+        f[sink]   = +1 / n_sink
+
+    Also annotates `adata.obs["endpoint_<graph>"]` with categorical labels
+    (``"source"``, ``"intermediate"``, ``"sink"``).
 
     Parameters
     ----------
-    adata_basis : anndata.AnnData or str
-        Object carrying the integrated graph the flow runs on.
-    adata_clust : anndata.AnnData or str
-        Object carrying the cluster labels in ``obs[cluster_key]``.
-    source_clusters : list of str
-        Cluster labels acting as flow sources.
-    sink_clusters : list of str, or None
-        Cluster labels acting as sinks. ``None`` runs SOURCE-ONLY mode: every
-        non-source LCC cell absorbs instead, and terminals are discovered afterwards
-        via :func:`terminality` / ``lineages(terminal_clusters=None)``.
+    adata : anndata.AnnData or str
+        AnnData containing graph connectivity in ``.obsp`` and cluster labels in
+        ``.obs[cluster_key]``, or path to an ``.h5ad`` file.
+    source_clusters : sequence of str
+        Cluster labels designating flow progenitors (sources).
+    sink_clusters : sequence of str, optional
+        Cluster labels designating flow terminals (sinks). If None, runs in
+        source-only mode where all non-source LCC cells act as absorbers.
     p_end : float, default 0.15
-        Sampling fraction; what it's a fraction of is set by ``p_basis``.
+        Fraction of cells sampled as endpoints.
     p_basis : {"cluster", "lcc"}, default "cluster"
-        Keyword-only. ``"cluster"``: ``p_end`` of each cluster's own eligible pool
-        (weighted by ``alloc_power``), at least one cell per cluster, so every declared
-        cluster takes part; source/sink totals can differ. ``"lcc"``: ``p_end`` of the
-        whole LCC, split equally across a role's clusters (cluster size ignored;
-        source/sink totals match); a cluster can then get no cells at all, which warns.
+        Sampling quota basis. ``"cluster"`` allocates `p_end` of each cluster's
+        pool (at least one cell per cluster). ``"lcc"`` allocates `p_end` of the
+        entire LCC divided equally across clusters.
     alloc_power : float, default 1.0
-        Keyword-only. Under ``p_basis="cluster"``, exponent ``k`` in a quota
-        proportional to ``pool_c ** k``: ``1.0`` proportional (default), ``0.0``
-        equal, values between interpolate. Inert under ``p_basis="lcc"``.
+        Cluster quota scaling exponent under ``p_basis="cluster"``. ``1.0`` is
+        proportional to cluster size, ``0.0`` is equal allocation.
     sampling_mode : str or dict, default "centered"
-        ``"random"`` | ``"centered"`` for either role, or ``{"source": ...,
-        "sink": ...}`` per role (a role the dict leaves out is ``"centered"``). Sink
-        also supports ``"directed"``, anchoring the sample on the cluster cell farthest
-        from any source; it was not the benchmarked mode.
+        Sampling strategy: ``"centered"`` (closest to cluster medoid) or
+        ``"random"``, or a dictionary specifying ``{"source": ..., "sink": ...}``.
     directed_metric : {"cost", "hops"}, default "cost"
-        Keyword-only. Geodesic used by sink ``"centered"``/``"directed"`` sampling.
-        ``"cost"`` follows the graph's edge costs (moves with ``alpha``); ``"hops"``
-        is unweighted, useful to hold the sampled endpoints fixed across a sweep.
+        Metric used for geodesic distances in centered sampling.
     cluster_key : str, default "clusters"
-        Column in ``adata_clust.obs`` holding cluster labels.
+        Column in ``adata.obs`` containing cluster labels.
     graph : str, optional
-        Which stored graph to sample on (``neighbors_<graph>``, e.g. ``"intr"`` or
-        ``"expr"`` from :func:`deltatrace.pp.graphs`); auto-detected when the object
-        holds only one.
+        Graph name to sample on (e.g. ``"intr"`` or ``"expr"``). Auto-detected if
+        only one integrated graph is present.
     seed : int, default 42
-        RNG seed. Each ``(role, cluster)`` draws from its own derived stream, so
-        results don't depend on list order. ``None`` draws and logs a fresh seed.
-    blocked_flows : list of (str, str), optional
-        ``(from_cluster, to_cluster)`` pairs whose directed edge cost is forced to
-        the maximum, discouraging flow in that direction.
+        Random seed for sampling reproducibility.
     sink_weights : {"uniform", "cluster_balanced"}, default "uniform"
-        SOURCE-ONLY only. How the diffuse-absorber demand is split over non-source
-        cells: ``"uniform"`` weights every cell equally; ``"cluster_balanced"``
-        gives each absorbing cluster equal total mass.
+        In source-only mode, how demand is distributed across non-source cells.
     verbose : int or bool, default 1
-        Logging verbosity; never affects results.
-
-    Also writes ``adata_basis.obs["endpoint_<graph>"]`` (categorical: ``source`` /
-    ``intermediate`` / ``sink``) with matching ``uns["endpoint_<graph>_colors"]``, so
-    ``scanpy.pl.embedding(adata, color="endpoint_<graph>")`` shows the sample.
+        Verbosity level (0: silent, 1: stages, 2: detailed progress).
 
     Returns
     -------
     dict
-        The flow problem for :func:`qrot`: ``"G"`` (:class:`CellGraph`, the cell graph
-        as scipy arrays; ``G.to_networkx()`` gives it as the networkx.DiGraph this key
-        used to hold), ``"cost_vec"`` (aligned with ``G.edge_array``),
-        ``"f"`` (demand vector), ``"source_cells"``/``"sink_cells"`` (names),
-        ``"source_indices"``/``"sink_indices"``, ``"disconnected_info"``,
-        ``"blocked_flows"``, ``"sink_cluster_map"`` (cell index -> sink cluster).
+        Flow problem dictionary containing:
+        - ``"G"``: :class:`CellGraph` containing graph structure and node mapping.
+        - ``"cost_vec"``: edge costs aligned with `G.edge_array`.
+        - ``"f"``: balanced demand vector of shape ``(n_cells,)``.
+        - ``"source_cells"``, ``"sink_cells"``: lists of sampled cell names.
+        - ``"source_indices"``, ``"sink_indices"``: arrays of sampled cell indices.
+        - ``"sink_cluster_map"``: mapping from sink cell indices to cluster names.
+        - ``"disconnected_info"``: summary of off-LCC cells.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(
+    ...     adata,
+    ...     source_clusters=["progenitor"],
+    ...     sink_clusters=["fate_A", "fate_B"],
+    ...     p_end=0.15,
+    ... )
+    >>> "G" in gr and "f" in gr
+    True
     """
     import scanpy as sc
+
+    if isinstance(adata, str):
+        adata = sc.read_h5ad(adata)
 
     if seed is None:
         # `_cluster_rng` keys on the seed's *string*, so None would freeze every draw on
@@ -193,23 +192,18 @@ def endpoints(
         )
     alloc_power = float(alloc_power)
 
-    if isinstance(adata_basis, str):
-        adata_basis = sc.read_h5ad(adata_basis)
-    if isinstance(adata_clust, str):
-        adata_clust = sc.read_h5ad(adata_clust)
-
     source_clusters = _as_labels(source_clusters, "source_clusters")
     if sink_clusters is not None:
         sink_clusters = _as_labels(sink_clusters, "sink_clusters")
-    _check_labels(adata_clust, cluster_key, source_clusters=source_clusters,
+    _check_labels(adata, cluster_key, source_clusters=source_clusters,
                   sink_clusters=sink_clusters)
 
-    graph = _resolve_graph(adata_basis, graph)
+    graph = _resolve_graph(adata, graph)
 
     import scipy.sparse.csgraph as csg
 
     # Build the bidirectional cell graph once, as scipy arrays (see CellGraph)
-    G_full = _build_cell_graph(adata_basis, graph=graph)
+    G_full = _build_cell_graph(adata, graph=graph)
     name_to_idx = G_full.graph["name_to_idx"]
     idx_to_name = G_full.graph["idx_to_name"]
     # Every geodesic below runs on this one cost matrix. It is symmetric, so directed=True
@@ -240,7 +234,7 @@ def endpoints(
         "component_sizes": sorted(comp_sizes.tolist(), reverse=True),
     }
 
-    labels = adata_clust.obs[cluster_key].astype(str)
+    labels = adata.obs[cluster_key].astype(str)
 
     # Labeled cells present in the graph, in obs order: their cell index and label
     graph_names = pd.Index(list(name_to_idx))
@@ -296,7 +290,7 @@ def endpoints(
                 raise ValueError(
                     f"{role} cluster '{c}': none of its {int((labels == c).sum())} cells "
                     f"are in the largest connected component of the '{graph}' graph. "
-                    "Drop the cluster, or raise p_keep in pp.graphs."
+                    "Drop the cluster, or raise p_keep in pp.integrate."
                 )
             pools[c] = pool
         proportional = {
@@ -382,7 +376,7 @@ def endpoints(
                 raise ValueError(
                     f"{role} cluster '{c}' needs {q} cells, but only {len(pool)} of its "
                     f"{int((labels == c).sum())} are in the largest connected component of "
-                    f"the '{graph}' graph. Lower p_end, or raise p_keep in pp.graphs.")
+                    f"the '{graph}' graph. Lower p_end, or raise p_keep in pp.integrate.")
 
     # Helpers: exact graph medoid + centered sampling, both intra cluster. All geodesics
     # run on _cost_csr, in cost units or (unweighted) hops.
@@ -564,31 +558,6 @@ def endpoints(
     # Cost vector aligned with G_full.edge_array (CSR storage order, the old G.edges() order)
     c = G_full.cost_vec.copy()
 
-    # Apply directional cluster-level cost
-    if blocked_flows:
-        blocked_set = set(blocked_flows)
-        # The same `(tail cluster, head cluster) in blocked_set` test as ever, asked once
-        # per distinct label pair rather than once per edge. A cell's code indexes
-        # `labs`; code 0 is None, for an unlabeled cell.
-        codes, uniq = pd.factorize(lab_name)
-        labs = [None, *uniq]
-        node_code = np.zeros(n_nodes, dtype=np.int64)
-        node_code[lab_cell] = codes + 1
-        n_labs = len(labs)
-        pair = node_code[G_full.edge_array[:, 0]] * n_labs + node_code[G_full.edge_array[:, 1]]
-        pairs, pair_inv = np.unique(pair, return_inverse=True)
-        blocked_pair = np.array(
-            [(labs[p // n_labs], labs[p % n_labs]) in blocked_set for p in pairs.tolist()],
-            dtype=bool,
-        )
-        hit = blocked_pair[pair_inv]
-        c[hit] = 1.0
-        n_biased = int(hit.sum())
-        _log.detail(
-            f"Blocked flow bias: {n_biased} edges set to max cost (1.0) "
-            f"for transitions {blocked_flows}"
-        )
-
     # Demand vector f for B J = f
     f = np.zeros(n_nodes, dtype=np.float64)
     f[source_cells_idx] = -1.0 / len(source_cells_idx)
@@ -644,12 +613,12 @@ def endpoints(
     # The same three classes pl.endpoints draws, as an obs column scanpy can color by
     # (sc.pl.embedding(adata, color="endpoint_<graph>")). Categories are fixed so the
     # legend order and colors match pl.endpoints even when a class is empty.
-    ep_class = np.full(adata_basis.n_obs, "intermediate", dtype=object)
+    ep_class = np.full(adata.n_obs, "intermediate", dtype=object)
     ep_class[np.asarray(source_cells_idx, dtype=np.int64)] = "source"
     ep_class[np.asarray(sink_cells_idx, dtype=np.int64)] = "sink"
-    adata_basis.obs[f"endpoint_{graph}"] = pd.Categorical(
+    adata.obs[f"endpoint_{graph}"] = pd.Categorical(
         ep_class, categories=["source", "intermediate", "sink"])
-    adata_basis.uns[f"endpoint_{graph}_colors"] = ["#3B4CC0", "lightgray", "#B40426"]
+    adata.uns[f"endpoint_{graph}_colors"] = ["#3B4CC0", "lightgray", "#B40426"]
 
     return {
         "G": G_full,
@@ -660,7 +629,6 @@ def endpoints(
         "source_indices": source_cells_idx,
         "sink_indices": sink_cells_idx,
         "disconnected_info": disconnected_info,
-        "blocked_flows": blocked_flows,
         "sink_cluster_map": sink_cluster_map,
     }
 

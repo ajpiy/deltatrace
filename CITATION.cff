@@ -5,8 +5,8 @@ type: software
 authors:
   - family-names: Paulsen
     given-names: Avery
-version: 0.1.0
-date-released: 2026-09-26
+version: 0.3.0
+date-released: 2026-10-15
 license: BSD-3-Clause
 repository-code: https://github.com/ajpiy/deltatrace
 keywords:

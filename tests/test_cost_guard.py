@@ -13,7 +13,7 @@ from deltatrace._utils import _build_cell_graph, _build_digraph
 @pytest.fixture
 def graph():
     adata, adata_dist = line_toy(n=90)
-    return dt.pp.graphs(adata, adata_dist, alpha=0.9, p_keep=0.3, verbose=0)
+    return dt.pp.integrate(adata, adata_dist, alpha=0.9, p_keep=0.3, verbose=0)
 
 
 def _poison(g, value, k=3):
@@ -38,7 +38,7 @@ def test_bad_costs_are_refused_before_endpoint_sampling(graph):
     """The user-facing entry: tl.endpoints must raise before any Dijkstra runs."""
     _poison(graph, -1.0, k=1)
     with pytest.raises(ValueError, match="1 negative"):
-        dt.tl.endpoints(graph, graph, ["source"], ["sink"], cluster_key="clusters",
+        dt.tl.endpoints(graph, ["source"], ["sink"], cluster_key="clusters",
                         graph="intr", p_end=0.2, verbose=0)
 
 

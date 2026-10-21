@@ -21,7 +21,7 @@ def run():
     adata.obs["clusters"] = pd.Categorical(
         np.where(t < 1 / 3, "source", np.where(t < 2 / 3, "mid",
                                                 np.where(i % 2 == 0, "A", "B"))))
-    g = dt.pp.graphs(adata, adata_dist, alpha=0.9, p_keep=0.3, verbose=0)
+    g = dt.pp.integrate(adata, adata_dist, alpha=0.9, p_keep=0.3, verbose=0)
     res = dt.tl.trajectory(g, ["source"], ["A", "B"], basis="spatial", p_end=0.2,
                            verbose=0)
     return g, res
@@ -54,7 +54,7 @@ def test_fate_column_names_are_h5_safe():
     dropping those); it is written as fate_L5_6."""
     adata, adata_dist = line_toy(n=150)
     adata.obs["clusters"] = adata.obs["clusters"].astype(str).replace({"sink": "L5/6"})
-    g = dt.pp.graphs(adata, adata_dist, alpha=0.9, p_keep=0.3, verbose=0)
+    g = dt.pp.integrate(adata, adata_dist, alpha=0.9, p_keep=0.3, verbose=0)
     dt.tl.trajectory(g, ["source"], ["L5/6"], basis="spatial", p_end=0.2, verbose=0)
     assert "fate_L5_6" in g.obs and not any("/" in c for c in g.obs.columns)
     assert list(g.uns["path_lineages"]) == ["L5/6"]           # the name itself is kept

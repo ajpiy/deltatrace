@@ -42,6 +42,10 @@ def _basis(intr_pairs):
     obj.obsp["neighbors_intr_connectivities"] = graph
     obj.uns["neighbors_intr"] = {"distances_key": "neighbors_intr_distances",
                                  "connectivities_key": "neighbors_intr_connectivities"}
+    expr = _sym([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)])
+    obj.obsp["neighbors_expr_distances"] = expr
+    obj.uns["neighbors_expr"] = {"distances_key": "neighbors_expr_distances",
+                                 "connectivities_key": "neighbors_expr_distances"}
     obj.obs["clusters"] = pd.Categorical(CLUSTERS)
     return obj
 
@@ -71,10 +75,10 @@ def clust():
     return obj
 
 
-def _solve(basis, adata_clust=None, **kw):
-    graph = dt.tl.endpoints(basis, basis, ["source"], ["sink"], cluster_key="clusters",
+def _solve(basis, **kw):
+    graph = dt.tl.endpoints(basis, ["source"], ["sink"], cluster_key="clusters",
                             graph="intr", p_end=0.2, verbose=0)
-    dt.tl.qrot(graph, adata_basis=basis, adata_clust=adata_clust, graph="intr",
+    dt.tl.qrot(graph, adata=basis, graph="intr",
                reconnect_graph="expr", verbose=0, **kw)
     return graph
 
@@ -99,7 +103,7 @@ def test_off_lcc_cells_get_the_lcc_median_when_reconnect_is_off(split_basis):
 def test_reconnect_true_still_takes_an_lcc_cells_value_not_the_median(split_basis, clust):
     """reconnect=True is untouched: geodesic donor, which here is NOT the LCC median."""
     reconnected = _basis([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (6, 7)])
-    _solve(reconnected, adata_clust=clust, reconnect=True)
+    _solve(reconnected, reconnect=True)
     _solve(split_basis, reconnect=False)
 
     pt_on = reconnected.obs["pseudotime"].to_numpy()
@@ -165,9 +169,9 @@ def test_a_missing_graph_leaves_pseudotime_alone():
 
 def test_the_median_is_logged_with_its_count_and_value(split_basis, capsys):
     """_log.detail is verbose=2 only, and must say how many cells were set and to what."""
-    graph = dt.tl.endpoints(split_basis, split_basis, ["source"], ["sink"],
+    graph = dt.tl.endpoints(split_basis, ["source"], ["sink"],
                             cluster_key="clusters", graph="intr", p_end=0.2, verbose=0)
-    dt.tl.qrot(graph, adata_basis=split_basis, graph="intr", reconnect=False, verbose=2)
+    dt.tl.qrot(graph, adata=split_basis, graph="intr", reconnect=False, verbose=2)
     out = capsys.readouterr().out
 
     median = float(np.median(split_basis.obs["pseudotime"].to_numpy()[LCC]))
@@ -182,9 +186,9 @@ def test_the_obs_disconnected_column_does_not_identify_every_cell_that_was_set(s
     multi-cell island off the LCC is absent from it while still receiving the median. This
     pins why ``qrot`` points at ``endpoints``' ``"disconnected_info"`` instead.
     """
-    graph = dt.tl.endpoints(split_basis, split_basis, ["source"], ["sink"],
+    graph = dt.tl.endpoints(split_basis, ["source"], ["sink"],
                             cluster_key="clusters", graph="intr", p_end=0.2, verbose=0)
-    dt.tl.qrot(graph, adata_basis=split_basis, graph="intr", reconnect=False, verbose=0)
+    dt.tl.qrot(graph, adata=split_basis, graph="intr", reconnect=False, verbose=0)
 
     off = _off_lcc_mask(split_basis, "intr")
     assert list(np.where(off)[0]) == ISLAND

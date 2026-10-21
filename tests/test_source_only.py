@@ -18,21 +18,21 @@ def graphed():
     # marker_noise=0 keeps expression exactly monotone in t, so no mass flows back into
     # the source cluster and the terminality table is the clean sink-vs-mid comparison
     # these tests pin. See tests/_line_toy.py.
-    return dt.pp.graphs(*line_toy(n=150, marker_noise=0.0),
+    return dt.pp.integrate(*line_toy(n=150, marker_noise=0.0),
                         alpha=0.9, p_keep=0.3, verbose=False)
 
 
 def _diffuse(obj):
-    gr = dt.tl.endpoints(obj, obj, ["source"], None, cluster_key="clusters", graph="intr",
+    gr = dt.tl.endpoints(obj, ["source"], None, cluster_key="clusters", graph="intr",
                          p_end=0.2, sampling_mode="directed", verbose=False)
-    dt.tl.qrot(gr, adata_basis=obj, adata_clust=obj, graph="intr", verbose=False)
+    dt.tl.qrot(gr, adata=obj, graph="intr", verbose=False)
     return gr
 
 
 def test_endpoints_source_only_builds_diffuse_demand(graphed):
     """sink_clusters=None -> f sums to 0, sources negative, non-source cells absorb."""
     obj = graphed.copy()
-    gr = dt.tl.endpoints(obj, obj, ["source"], None, cluster_key="clusters",
+    gr = dt.tl.endpoints(obj, ["source"], None, cluster_key="clusters",
                          graph="intr", p_end=0.2, verbose=False)
     f = gr["f"]
     assert abs(f.sum()) < 1e-9                       # renormalized to 0
@@ -46,9 +46,9 @@ def test_endpoints_source_only_builds_diffuse_demand(graphed):
 def test_source_and_source_only_flows_differ(graphed):
     """The diffuse solve is genuinely different from a source+sink solve."""
     a = graphed.copy()
-    gr = dt.tl.endpoints(a, a, ["source"], ["sink"], cluster_key="clusters", graph="intr",
+    gr = dt.tl.endpoints(a, ["source"], ["sink"], cluster_key="clusters", graph="intr",
                          p_end=0.2, sampling_mode="directed", verbose=False)
-    dt.tl.qrot(gr, adata_basis=a, adata_clust=a, graph="intr", verbose=False)
+    dt.tl.qrot(gr, adata=a, graph="intr", verbose=False)
     pt_ss = a.obs["pseudotime"].to_numpy(float).copy()
 
     b = graphed.copy()
@@ -115,7 +115,7 @@ def _unbalanced(graphed):
     cluster_balanced put the SAME demand on it and every test below would pass under
     either. The weighting only shows itself when the absorbing clusters differ in size.
     Labels are read at endpoint time and the graph does not depend on them, so relabelling
-    after dt.pp.graphs is safe.
+    after dt.pp.integrate is safe.
     """
     obj = graphed.copy()
     lab = obj.obs["clusters"].astype(str).to_numpy()
@@ -137,14 +137,14 @@ def test_source_only_defaults_to_uniform(graphed):
     """The default must weight cells, not clusters: passing 'uniform' changes nothing."""
     obj = _unbalanced(graphed)
     kw = dict(cluster_key="clusters", graph="intr", p_end=0.2, verbose=False)
-    default = dt.tl.endpoints(obj, obj, ["source"], None, **kw)["f"]
-    uniform = dt.tl.endpoints(obj, obj, ["source"], None, sink_weights="uniform", **kw)["f"]
+    default = dt.tl.endpoints(obj, ["source"], None, **kw)["f"]
+    uniform = dt.tl.endpoints(obj, ["source"], None, sink_weights="uniform", **kw)["f"]
     np.testing.assert_array_equal(default, uniform)
 
 
 def test_sink_weights_uniform_gives_every_absorber_equal_mass(graphed):
     obj = _unbalanced(graphed)
-    gr = dt.tl.endpoints(obj, obj, ["source"], None, cluster_key="clusters", graph="intr",
+    gr = dt.tl.endpoints(obj, ["source"], None, cluster_key="clusters", graph="intr",
                          p_end=0.2, sink_weights="uniform", verbose=False)
     f = gr["f"]
     assert abs(f.sum()) < 1e-9
@@ -161,7 +161,7 @@ def test_sink_weights_uniform_gives_every_absorber_equal_mass(graphed):
 def test_sink_weights_cluster_balanced_equalises_clusters_not_cells(graphed):
     """The non-default: equal mass per cluster, which over-weights the tiny one per cell."""
     obj = _unbalanced(graphed)
-    gr = dt.tl.endpoints(obj, obj, ["source"], None, cluster_key="clusters", graph="intr",
+    gr = dt.tl.endpoints(obj, ["source"], None, cluster_key="clusters", graph="intr",
                          p_end=0.2, sink_weights="cluster_balanced", verbose=False)
     mass, n = _demand_by_cluster(gr, obj)
     assert set(mass) == {"mid", "rare", "sink"}
@@ -177,8 +177,8 @@ def test_sink_weights_cluster_balanced_equalises_clusters_not_cells(graphed):
 def test_the_two_weightings_actually_differ_when_clusters_are_unbalanced(graphed):
     obj = _unbalanced(graphed)
     kw = dict(cluster_key="clusters", graph="intr", p_end=0.2, verbose=False)
-    u = dt.tl.endpoints(obj, obj, ["source"], None, sink_weights="uniform", **kw)
-    b = dt.tl.endpoints(obj, obj, ["source"], None, sink_weights="cluster_balanced", **kw)
+    u = dt.tl.endpoints(obj, ["source"], None, sink_weights="uniform", **kw)
+    b = dt.tl.endpoints(obj, ["source"], None, sink_weights="cluster_balanced", **kw)
 
     # same absorber SET -- the weighting splits mass, it does not choose cells
     np.testing.assert_array_equal(u["f"] > 0, b["f"] > 0)
@@ -193,7 +193,7 @@ def test_the_two_weightings_actually_differ_when_clusters_are_unbalanced(graphed
 
 def test_sink_weights_rejects_unknown_value(graphed):
     with pytest.raises(ValueError, match="sink_weights must be"):
-        dt.tl.endpoints(graphed.copy(), graphed, ["source"], None, cluster_key="clusters",
+        dt.tl.endpoints(graphed.copy(), ["source"], None, cluster_key="clusters",
                         graph="intr", p_end=0.2, sink_weights="balanced", verbose=False)
 
 

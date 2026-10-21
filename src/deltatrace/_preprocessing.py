@@ -1,9 +1,9 @@
-"""pp: spatial distances (wasserstein), integrated graphs (integrate, graphs)."""
+"""pp: spatial distances (wasserstein), integrated graphs (integrate)."""
 
 from __future__ import annotations
 
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from itertools import pairwise
 
 import anndata as ad
@@ -13,7 +13,7 @@ import scipy.sparse as sp
 from scipy.spatial.distance import cdist
 
 from . import _log
-from ._utils import _MODE_GRAPHS, _PKG_DIR, _is_positional_index, _renamed_kwargs
+from ._utils import _MODE_GRAPHS, _PKG_DIR, _is_positional_index
 
 
 # ---------------------------------------------------------------------------
@@ -43,10 +43,10 @@ def _emd_rows(rows, nbrs_arr, nbr_lens, weights_arr, coords):
                 emd, log = ot.emd2(w_i, weights_arr[j, :k_j], cost, log=True)
                 # the network simplex can land a hair below 0 for near-identical distributions
                 emd = np.maximum(emd, 0)
-                if not np.isfinite(emd):
+                if not np.isfinite(emd) or log.get("result_code") == 2:
                     n_dropped += 1
                 # POT's MAX_ITER_REACHED: an early-stopped plan can miss the marginals, bounding nothing
-                elif log["result_code"] == 3:
+                elif log.get("result_code") == 3:
                     n_unconverged += 1
                 else:
                     d[j - i - 1] = emd
@@ -62,52 +62,51 @@ def wasserstein(
     verbose: int | bool = 1,
     n_jobs: int = -1,
 ) -> ad.AnnData:
-    """Earth-Mover's distance between cells' spot-mapping distributions.
+    """Compute pairwise Wasserstein-1 distances between single-cell spot-mapping distributions.
 
-    Each cell is a distribution over spatial spots (the cell-to-spot mapping ``M``,
-    e.g. from tangram); spot-spot Euclidean distance D is the ground metric:
+    Treats each cell as a probability distribution over spatial spots (e.g. from
+    Tangram or Cell2location deconvolution), using Euclidean distance between
+    spatial spots as ground metric:
 
         W1(a, b) = min_{P >= 0}  <D, P>
         s.t.                     P 1 = a,  P^T 1 = b
 
-    Only the top ``mass_threshold`` fraction of each cell's mass is kept, which is
-    what keeps the all-pairs cost tractable. Cells with the same distribution are at
-    distance 0, which :func:`integrate` keeps as the closest pair. Pairs whose EMD comes
-    back non-finite, or that hit the solver's iteration cap, are left undefined (NaN) and
-    counted in one ``RuntimeWarning``. A mapping whose median cell keeps over half of all
-    spots is warned about as nearly uniform.
+    Only the top `mass_threshold` fraction of each cell's spot mass is retained
+    and renormalized to keep all-pairs EMD computation tractable. Cells with identical
+    distributions have distance 0.
 
     Parameters
     ----------
     M : anndata.AnnData or str
-        Cell-to-spot mapping ``(n_cells, n_spots)``, each row a distribution over
-        spots. A path to an ``.h5ad`` file is also accepted. When both ``M.var_names``
-        and ``adata_sp.obs_names`` are named, the spots are matched by name (a
-        ValueError if they name different spots or repeat one); with a default
-        0, 1, 2, ... index on either side, ``M``'s columns are read in ``adata_sp``'s order.
+        Cell-to-spot mapping of shape ``(n_cells, n_spots)``, or path to an ``.h5ad``
+        file. Each row is a distribution over spots. Columns are matched to
+        `adata_sp` by spot name or positional index.
     adata_sp : anndata.AnnData
-        Spatial reference; needs ``obsm["spatial"]`` of shape ``(n_spots, 2)``.
+        Spatial reference object with spot coordinates in ``obsm["spatial"]`` of shape
+        ``(n_spots, 2)``.
     pxl_to_um : float, default 1.0
-        Pixel-to-micron scale.
+        Conversion factor scaling spatial coordinates to microns.
     mass_threshold : float, default 0.9
-        Per-cell cumulative-mass cutoff for which spots are kept and renormalized.
+        Per-cell cumulative mass threshold; only spots within this top fraction
+        are kept for EMD calculation.
     verbose : int or bool, default 1
-        Logging verbosity (0 silent, 2 most detailed).
+        Verbosity level (0: silent, 1: stages, 2: detailed progress).
     n_jobs : int, default -1
-        Joblib workers; ``-1`` uses all cores, ``1`` runs in this process. Every cell
-        pair is solved, so this is the step that grows fastest with the number of cells.
-        The result does not depend on it. Starting the workers costs about a second,
-        and joblib falls back to one process where it cannot spawn any.
+        Joblib parallel workers. ``-1`` uses all available CPU cores.
 
     Returns
     -------
     anndata.AnnData
-        Indexed by ``M``'s cell names, with no variables;
-        ``uns["distances"]`` holds every pairwise distance (microns) once, as a
-        float64 vector in SciPy's condensed ``pdist`` order
-        (``scipy.spatial.distance.squareform`` gives the square matrix). That is
-        ``4 n_cells^2`` bytes, half a dense matrix. :func:`integrate` /
-        :func:`graphs` read it as ``adata_dist``.
+        AnnData indexed by cell names where ``uns["distances"]`` contains the
+        condensed pairwise distance vector (SciPy ``pdist`` order).
+        Can be passed directly as `adata_dist` to :func:`deltatrace.pp.integrate`.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> # M: AnnData (cells x spots) from Tangram / Cell2location
+    >>> # adata_sp: AnnData (spots) with obsm["spatial"]
+    >>> adata_dist = dt.pp.wasserstein(M, adata_sp, pxl_to_um=1.0)  # doctest: +SKIP
     """
     import scanpy as sc
     from joblib import Parallel, delayed, effective_n_jobs
@@ -322,22 +321,66 @@ def _align_distance_matrix(names_sc, names_dist):
 def _square_to_condensed(D):
     """Condensed form of a square distance matrix (NaN where a sparse one stores nothing), checked and max-symmetrized a block of rows at a time."""
     n = D.shape[0]
-    D = D.tocsr() if sp.issparse(D) else D
+    if sp.issparse(D):
+        D = D.tocoo(copy=True)
+        D.sum_duplicates()
+        rows, cols = D.row.astype(np.int64), D.col.astype(np.int64)
+        vals = D.data.astype(np.float64)
+        n_nonzero = np.count_nonzero(vals)
+        n_bad = np.count_nonzero(~np.isfinite(vals))
+        n_neg = np.count_nonzero(vals < 0)
+        diag = rows == cols
+        n_diag = int((vals[diag] > 0).sum())
+
+        if not n_nonzero:
+            raise ValueError("Distance matrix has no nonzero entries.")
+        if n_bad:
+            raise ValueError(
+                f"Distance matrix has {n_bad} non-finite entries (NaN or inf); leave unknown "
+                "pairs out of a sparse matrix instead."
+            )
+        if n_neg:
+            raise ValueError(
+                f"Distance matrix has {n_neg} negative entries; distances must be >= 0."
+            )
+        if n_diag:
+            _log.detail(f"Dropping {n_diag} stored diagonal entries")
+            if n_nonzero == n_diag:
+                raise ValueError("Distance matrix has no off-diagonal nonzero entries.")
+
+        off = ~diag
+        r, c, v = rows[off], cols[off], vals[off]
+        upper = r < c
+        idx_u = _pair_index(n, r[upper], c[upper])
+        val_u = v[upper]
+        idx_l = _pair_index(n, c[~upper], r[~upper])
+        val_l = v[~upper]
+
+        all_idx = np.concatenate([idx_u, idx_l])
+        uniq_idx, counts = np.unique(all_idx, return_counts=True)
+        n_single = int(np.count_nonzero(counts == 1))
+        both_mask_u = np.isin(idx_u, uniq_idx[counts == 2])
+        both_mask_l = np.isin(idx_l, uniq_idx[counts == 2])
+        idx_both_u, val_both_u = idx_u[both_mask_u], val_u[both_mask_u]
+        idx_both_l, val_both_l = idx_l[both_mask_l], val_l[both_mask_l]
+        o_u = np.argsort(idx_both_u)
+        o_l = np.argsort(idx_both_l)
+        diff_val = int(np.count_nonzero(val_both_u[o_u] != val_both_l[o_l]))
+        n_asym = 2 * (n_single + diff_val)
+
+        dc = np.full(n * (n - 1) // 2, np.nan)
+        np.fmax.at(dc, idx_u, val_u)
+        np.fmax.at(dc, idx_l, val_l)
+        if n_asym:
+            _log.detail(f"Symmetrizing distance matrix ({n_asym} asymmetric entries)")
+        return dc
+
     dc = np.empty(n * (n - 1) // 2)
     row_start = np.r_[0, np.cumsum(np.arange(n - 1, 0, -1))]
     n_nonzero = n_bad = n_neg = n_diag = n_asym = 0
     step = max(1, 2**22 // max(n, 1))
     for s in range(0, n, step):
-        B = D[s:s + step]
-        if sp.issparse(B):
-            # a stored entry is a distance (0 included), an absent one is not
-            B = B.tocoo()
-            B.sum_duplicates()
-            vals = B.data.astype(np.float64)
-            rows, cols, B = B.row, B.col, np.full(B.shape, np.nan)
-            B[rows, cols] = vals
-        else:
-            B = vals = np.asarray(B, dtype=np.float64)
+        B = vals = np.asarray(D[s:s + step], dtype=np.float64)
         n_nonzero += np.count_nonzero(vals)
         n_bad += np.count_nonzero(~np.isfinite(vals))
         n_neg += np.count_nonzero(vals < 0)
@@ -422,62 +465,86 @@ def _keep_threshold(dc, p_keep):
     return threshold, d_max, n_dist, n_kept, top
 
 
-def _blend_with_distances(adata, adata_dist, expr_conn, alpha, p_keep, mode):
+def _blend_with_distances(adata, adata_dist, expr_conn, alpha, p_keep, mode, _cached=None):
     """The spatial half of :func:`integrate`: blended connectivities and their params."""
     n_cells = expr_conn.shape[0]
 
-    # condensed vector, or a square matrix to condense once the names are checked
-    if isinstance(adata_dist, pd.DataFrame):
-        if not adata_dist.index.equals(adata_dist.columns):
-            raise ValueError(
-                "adata_dist's row and column labels must name the same cells in the "
-                "same order."
-            )
-        names, D = adata_dist.index, adata_dist.to_numpy()
-    elif "distances" in adata_dist.uns:
-        names, D = adata_dist.obs_names, np.asarray(adata_dist.uns["distances"])
+    if _cached is not None and "dc" in _cached:
+        threshold = _cached["threshold"]
+        d_max = _cached["d_max"]
+        d_top = _cached["d_top"]
+        n_kept = _cached["n_kept"]
+        expr_conn_max = _cached["expr_conn_max"]
+        d = _cached["d"]
+        keep = _cached["keep"]
+        conn = _cached["conn"]
     else:
-        names, D = adata_dist.obs_names, adata_dist.X
-    n_dist = len(names) if D.ndim == 1 else D.shape[0]
-    if n_dist != n_cells:
-        raise ValueError(f"Cell count mismatch: sc={n_cells}, dist={n_dist}")
-    if D.ndim == 1 and D.size != n_cells * (n_cells - 1) // 2:
-        raise ValueError(
-            f"adata_dist.uns['distances'] holds {D.size} distances; {n_cells} cells "
-            f"have {n_cells * (n_cells - 1) // 2} pairs."
+        # condensed vector, or a square matrix to condense once the names are checked
+        if isinstance(adata_dist, pd.DataFrame):
+            if not adata_dist.index.equals(adata_dist.columns):
+                raise ValueError(
+                    "adata_dist's row and column labels must name the same cells in the "
+                    "same order."
+                )
+            names, D = adata_dist.index, adata_dist.to_numpy()
+        elif "distances" in adata_dist.uns:
+            names, D = adata_dist.obs_names, np.asarray(adata_dist.uns["distances"])
+        else:
+            names, D = adata_dist.obs_names, adata_dist.X
+        n_dist = len(names) if D.ndim == 1 else D.shape[0]
+        if n_dist != n_cells:
+            raise ValueError(f"Cell count mismatch: sc={n_cells}, dist={n_dist}")
+        if D.ndim == 1 and D.size != n_cells * (n_cells - 1) // 2:
+            raise ValueError(
+                f"adata_dist.uns['distances'] holds {D.size} distances; {n_cells} cells "
+                f"have {n_cells * (n_cells - 1) // 2} pairs."
+            )
+        if D.ndim == 2 and D.shape[1] != n_cells:
+            raise ValueError(
+                f"Distance matrix must be square over the cells: got {D.shape[0]}x"
+                f"{D.shape[1]} for {n_cells} cells."
+            )
+        perm = _align_distance_matrix(adata.obs_names, names)
+        dc = D if D.ndim == 1 else _square_to_condensed(D)
+
+        threshold, d_max, n_pos, n_kept, d_top = _keep_threshold(dc, p_keep)
+        _log.detail(
+            f"Distance filtering: kept {2 * n_kept} / {2 * n_pos} edges "
+            f"(p_keep={p_keep}, threshold={threshold:.4g})"
         )
-    if D.ndim == 2 and D.shape[1] != n_cells:
-        raise ValueError(
-            f"Distance matrix must be square over the cells: got {D.shape[0]}x"
-            f"{D.shape[1]} for {n_cells} cells."
+        expr_conn_max = expr_conn.data.max()
+        _log.detail(
+            f"Normalization - expr_conn_max: {expr_conn_max:.4g}, "
+            f"ext_dist_max: {d_max:.4g}"
         )
-    perm = _align_distance_matrix(adata.obs_names, names)
-    dc = D if D.ndim == 1 else _square_to_condensed(D)
 
-    threshold, d_max, n_pos, n_kept, d_top = _keep_threshold(dc, p_keep)
-    _log.detail(
-        f"Distance filtering: kept {2 * n_kept} / {2 * n_pos} edges "
-        f"(p_keep={p_keep}, threshold={threshold:.4g})"
-    )
-    expr_conn_max = expr_conn.data.max()
-    _log.detail(
-        f"Normalization - expr_conn_max: {expr_conn_max:.4g}, "
-        f"ext_dist_max: {d_max:.4g}"
-    )
+        # distance of each expression edge u-v, looked up in the condensed vector
+        u = np.repeat(np.arange(n_cells), np.diff(expr_conn.indptr))
+        v = expr_conn.indices.astype(np.int64)
+        if perm is not None:
+            u, v = perm[u], perm[v]
+        lo, hi = np.minimum(u, v), np.maximum(u, v)
+        off_diag = lo < hi
+        d = np.full(expr_conn.nnz, np.nan)
+        d[off_diag] = dc[_pair_index(n_cells, lo[off_diag], hi[off_diag])]
 
-    # distance of each expression edge u-v, looked up in the condensed vector
-    u = np.repeat(np.arange(n_cells), np.diff(expr_conn.indptr))
-    v = expr_conn.indices.astype(np.int64)
-    if perm is not None:
-        u, v = perm[u], perm[v]
-    lo, hi = np.minimum(u, v), np.maximum(u, v)
-    off_diag = lo < hi
-    d = np.full(expr_conn.nnz, np.nan)
-    d[off_diag] = dc[_pair_index(n_cells, lo[off_diag], hi[off_diag])]
+        # kept edges: (1 - alpha) expression connectivity + alpha spatial similarity 1 - d/d_max
+        keep = (d >= 0) & (d <= threshold)
+        conn = (expr_conn.data / expr_conn_max).astype(np.float64)
 
-    # kept edges: (1 - alpha) expression connectivity + alpha spatial similarity 1 - d/d_max
-    keep = (d >= 0) & (d <= threshold)
-    conn = (expr_conn.data / expr_conn_max).astype(np.float64)
+        if _cached is not None:
+            _cached.update(
+                dc=dc,
+                threshold=threshold,
+                d_max=d_max,
+                d_top=d_top,
+                n_kept=n_kept,
+                expr_conn_max=expr_conn_max,
+                d=d,
+                keep=keep,
+                conn=conn,
+            )
+
     # when every kept distance is 0 (threshold 0), each kept pair is fully similar
     blended = (1 - alpha) * conn + alpha * (1.0 - d / (d_max or 1.0))
     not_kept = 0.0 if mode == "intersection" else (1 - alpha) * conn
@@ -524,9 +591,8 @@ def _integrate_message(a) -> str:
             + (" from expression alone" if a.get("adata_dist") is None else ""))
 
 
-@_renamed_kwargs(tag="key_added")
 @_log.stage(_integrate_message)
-def integrate(
+def _integrate_single(
     adata_sc,
     adata_dist=None,
     alpha: float = 0.3,
@@ -535,6 +601,8 @@ def integrate(
     neighbors_key: str = "neighbors",
     key_added: str | None = None,
     verbose: int | bool = 1,
+    *,
+    _dist_cache=None,
 ) -> ad.AnnData:
     """Constrain an expression kNN graph by how far apart cells are in the tissue.
 
@@ -645,7 +713,7 @@ def integrate(
         _log.detail("No adata_dist: storing the expression graph alone (alpha=0)")
     else:
         int_conn_csr, info = _blend_with_distances(
-            adata, adata_dist, expr_conn, alpha, p_keep, mode)
+            adata, adata_dist, expr_conn, alpha, p_keep, mode, _cached=_dist_cache)
 
     # Transport cost = clip(-ln(conn), floor, cap) on the union-symmetrized connectivity.
     conn_sym = int_conn_csr.maximum(int_conn_csr.T).tocsr()
@@ -665,7 +733,7 @@ def integrate(
 
     # Disconnected-node detection (intersection only; expression cannot orphan a cell)
     if mode == "intersection":
-        degree = np.diff(int_conn_csr.indptr)
+        degree = np.diff(conn_sym.indptr)
         disconnected_mask = degree == 0
         disconnected_indices = np.where(disconnected_mask)[0]
         connected_indices = np.where(~disconnected_mask)[0]
@@ -712,75 +780,140 @@ def integrate(
 
 
 # ---------------------------------------------------------------------------
-# pp.graphs
+# pp.integrate
 # ---------------------------------------------------------------------------
-@_log.container()
-def graphs(
+def integrate(
     adata_sc,
     adata_dist=None,
-    *,
     alpha: float = 0.3,
     p_keep: float = 0.3,
-    modes=None,
+    mode: str | None = None,
     neighbors_key: str = "neighbors",
+    key_added: str | None = None,
     verbose: int | bool = 1,
+    *,
+    modes: Sequence[str] | None = None,
 ) -> ad.AnnData:
-    """Build every requested graph mode into ONE object.
+    """Integrate a single-cell expression kNN graph with spatial cell-cell distances.
 
-    Runs :func:`integrate` once per mode and merges the results, so e.g. a baseline
-    and a spatially constrained graph sit side by side in one AnnData instead of two
-    that can drift apart. With more than one graph present, the stage functions
-    (``tl.endpoints``, ``tl.qrot``, ``pl.endpoints``) need ``graph=``; ``tl.trajectory``
-    takes ``"intr"`` when it is stored, else the only graph there is.
+    Combines transcriptomic similarities and physical/Wasserstein distances:
+
+        conn = (1 - alpha) * expr_conn + alpha * spatial_sim
+        cost = clip(-ln(conn), floor, cap)
+
+    In intersection mode (``"intr"``), only edges satisfying the spatial distance
+    quantile threshold (`p_keep`) are kept. In expression mode (``"expr"``), all
+    expression edges are retained with spatial penalties.
+
+    By default, when `adata_dist` is provided, both ``"expr"`` and ``"intr"``
+    graphs are computed and stored into `adata_sc`. When `adata_dist=None`, only
+    the normalized expression graph (``"expr"``) is built.
 
     Parameters
     ----------
-    adata_sc, adata_dist
-        As for :func:`integrate`. Without ``adata_dist`` only the plain expression graph
-        (``"expr"``) is built.
-    alpha, p_keep, neighbors_key
-        Passed through to :func:`integrate` for every mode (defaults ``alpha=0.3``,
-        ``p_keep=0.3``).
-    modes : sequence of str, optional
-        Which graphs to build, stored as ``graph="expr"`` and ``graph="intr"``. Default:
-        both, or ``("expression",)`` when there is no ``adata_dist``.
+    adata_sc : anndata.AnnData or str
+        Single-cell AnnData with a kNN graph in ``.obsp``, or path to an ``.h5ad`` file.
+    adata_dist : anndata.AnnData, pandas.DataFrame or str, optional
+        Cell-cell spatial distance output from :func:`wasserstein` (condensed vector
+        in ``uns["distances"]``) or square distance matrix. If None, builds the
+        expression graph alone.
+    alpha : float, default 0.3
+        Spatial blending weight in ``[0, 1]``. ``alpha=0`` uses expression only.
+    p_keep : float, default 0.3
+        Distance quantile cutoff for intersection filtering. Edges with distance
+        above this quantile are pruned.
+    mode : {"intersection", "expression"}, optional
+        Graph mode to build. If None, builds both ``"expression"`` and ``"intersection"``
+        when `adata_dist` is provided, or ``"expression"`` when `adata_dist` is None.
+    neighbors_key : str, default "neighbors"
+        Key in `adata_sc` for the base expression kNN graph.
+    key_added : str, optional
+        Custom key suffix to store the graph under (``neighbors_<key_added>``).
     verbose : int or bool, default 1
-        Logging verbosity.
+        Verbosity level (0: silent, 1: stages, 2: detailed progress).
+    modes : sequence of str, optional
+        Explicit sequence of graph modes to construct (e.g. ``("expression", "intersection")``).
 
     Returns
     -------
     anndata.AnnData
-        One object carrying every requested graph, under ``neighbors_<graph>``.
+        Updated AnnData object carrying the integrated graph(s) under
+        ``obsp["neighbors_<graph>_connectivities"]`` and
+        ``obsp["neighbors_<graph>_distances"]``.
+
+    Examples
+    --------
+    Spatial integration combining expression and spatial distances:
+
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist, alpha=0.3, p_keep=0.3)
+    >>> "neighbors_intr" in adata.uns and "neighbors_expr" in adata.uns
+    True
+
+    Expression-only baseline (no spatial data):
+
+    >>> adata = dt.pp.integrate(adata, mode="expression")
     """
-    if modes is None:
-        modes = ("expression", "intersection") if adata_dist is not None else ("expression",)
-    modes = list(modes)
+    if key_added is not None:
+        return _integrate_single(
+            adata_sc,
+            adata_dist,
+            alpha=alpha,
+            p_keep=p_keep,
+            mode=mode or "intersection",
+            neighbors_key=neighbors_key,
+            key_added=key_added,
+            verbose=verbose,
+        )
+
+    if modes is not None:
+        modes = list(modes)
+    elif mode == "intersection":
+        if adata_dist is None:
+            raise ValueError("integrate(): mode='intersection' needs adata_dist.")
+        modes = ["expression", "intersection"]
+    elif mode == "expression":
+        modes = ["expression"]
+    elif mode is not None:
+        raise ValueError(f"mode must be 'intersection' or 'expression', got {mode!r}")
+    else:
+        modes = ["expression", "intersection"] if adata_dist is not None else ["expression"]
+
     if not modes:
-        raise ValueError("graphs(): `modes` must name at least one graph mode.")
+        raise ValueError("integrate(): `modes` must name at least one graph mode.")
     unknown = [m for m in modes if m not in _MODE_GRAPHS]
     if unknown:
         raise ValueError(
-            f"graphs(): unknown mode(s) {unknown}; choose from {sorted(_MODE_GRAPHS)}."
+            f"integrate(): unknown mode(s) {unknown}; choose from {sorted(_MODE_GRAPHS)}."
         )
 
+    _dist_cache = {} if adata_dist is not None else None
     out = None
-    for mode in modes:
-        res = integrate(
-            adata_sc, adata_dist, alpha=alpha, p_keep=p_keep, mode=mode,
-            neighbors_key=neighbors_key, verbose=verbose,
+    for m in modes:
+        res = _integrate_single(
+            adata_sc,
+            adata_dist,
+            alpha=alpha,
+            p_keep=p_keep,
+            mode=m,
+            neighbors_key=neighbors_key,
+            verbose=verbose,
+            _dist_cache=_dist_cache,
         )
         if out is None:
             out = res
             continue
-        graph = _MODE_GRAPHS[mode]
+        graph = _MODE_GRAPHS[m]
         nk = f"neighbors_{graph}"
         out.obsp[f"{nk}_distances"] = res.obsp[f"{nk}_distances"]
         out.obsp[f"{nk}_connectivities"] = res.obsp[f"{nk}_connectivities"]
         out.uns[nk] = res.uns[nk]
-        disc = f"disconnected_{graph}"        # intersection-family bookkeeping
+        disc = f"disconnected_{graph}"
         if disc in res.obs:
             out.obs[disc] = res.obs[disc].to_numpy()
         if disc in res.uns:
             out.uns[disc] = res.uns[disc]
-    _log.detail(f"graphs {[_MODE_GRAPHS[m] for m in modes]} built into one object")
+
+    _log.detail(f"integrated graph(s) {[_MODE_GRAPHS[m] for m in modes]} built into one object")
     return out

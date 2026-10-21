@@ -46,6 +46,9 @@ def basis_and_clust():
                                    "connectivities_key": "neighbors_intr_connectivities"}
 
     expr = _sym([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)])
+    basis.obsp["neighbors_expr_distances"] = expr
+    basis.uns["neighbors_expr"] = {"distances_key": "neighbors_expr_distances",
+                                   "connectivities_key": "neighbors_expr_distances"}
     clust = ad.AnnData(X=np.zeros((N, 2), np.float32), obs=pd.DataFrame(index=names))
     clust.obsp["neighbors_expr_distances"] = expr
     clust.uns["neighbors_expr"] = {"distances_key": "neighbors_expr_distances",
@@ -70,12 +73,12 @@ def test_off_lcc_mask_returns_none_without_a_graph():
 
 def test_island_cells_are_reassigned_from_the_lcc(basis_and_clust):
     """An island's own dual is arbitrary; after reconnection it must equal some LCC value."""
-    basis, clust = basis_and_clust
+    basis, _ = basis_and_clust
     lcc_pt = {f"c{i}": i / 5.0 for i in LCC}          # 0.0 .. 1.0 along the path
     arbitrary = 0.8179                                # the unpinned island dual
     pt = dict(lcc_pt, **{f"c{i}": arbitrary for i in ISLAND})
 
-    out = _reconnect_pseudotime(basis, clust, pt, graph="intr",
+    out = _reconnect_pseudotime(basis, pt, graph="intr",
                                 reconnect_graph="expr")
 
     for i in ISLAND:
@@ -87,10 +90,10 @@ def test_island_cells_are_reassigned_from_the_lcc(basis_and_clust):
 
 
 def test_lcc_pseudotime_is_untouched(basis_and_clust):
-    basis, clust = basis_and_clust
+    basis, _ = basis_and_clust
     lcc_pt = {f"c{i}": i / 5.0 for i in LCC}
     pt = dict(lcc_pt, **{f"c{i}": 0.8179 for i in ISLAND})
-    out = _reconnect_pseudotime(basis, clust, pt, graph="intr",
+    out = _reconnect_pseudotime(basis, pt, graph="intr",
                                 reconnect_graph="expr")
     for k, v in lcc_pt.items():
         assert out[k] == pytest.approx(v)
@@ -100,21 +103,21 @@ def test_an_island_can_never_be_a_donor(basis_and_clust):
     """The donor pool is the complement of the repair mask, so widening the mask to
     off-LCC also removes islands as donors. Give the island a value no LCC cell has: if it
     ever leaks into another cell, that cell would carry it."""
-    basis, clust = basis_and_clust
+    basis, _ = basis_and_clust
     sentinel = -12345.0
     lcc_pt = {f"c{i}": i / 5.0 for i in LCC}
     pt = dict(lcc_pt, **{f"c{i}": sentinel for i in ISLAND})
 
-    out = _reconnect_pseudotime(basis, clust, pt, graph="intr",
+    out = _reconnect_pseudotime(basis, pt, graph="intr",
                                 reconnect_graph="expr")
 
     assert sentinel not in out.values(), "an unpinned island dual survived or propagated"
 
 
 def test_reconnect_assigns_every_cell(basis_and_clust):
-    basis, clust = basis_and_clust
+    basis, _ = basis_and_clust
     pt = dict({f"c{i}": i / 5.0 for i in LCC}, **{f"c{i}": 0.5 for i in ISLAND})
-    out = _reconnect_pseudotime(basis, clust, pt, graph="intr",
+    out = _reconnect_pseudotime(basis, pt, graph="intr",
                                 reconnect_graph="expr")
     assert set(out) == {f"c{i}" for i in range(N)}
     assert all(np.isfinite(v) for v in out.values())
@@ -152,9 +155,9 @@ def test_off_lcc_cells_are_not_left_nan_when_reconnect_is_off(basis_and_clust):
     basis.obs["clusters"] = pd.Categorical(
         ["source", "source", "mid", "mid", "sink", "sink", "mid", "mid"]
     )
-    graph = dt.tl.endpoints(basis, basis, ["source"], ["sink"], cluster_key="clusters",
+    graph = dt.tl.endpoints(basis, ["source"], ["sink"], cluster_key="clusters",
                             graph="intr", p_end=0.2, verbose=0)
-    dt.tl.qrot(graph, adata_basis=basis, graph="intr", reconnect=False, verbose=0)
+    dt.tl.qrot(graph, adata=basis, graph="intr", reconnect=False, verbose=0)
 
     pt = basis.obs["pseudotime"].to_numpy()
     island, lcc = pt[ISLAND], pt[LCC]
@@ -173,13 +176,13 @@ def test_reconnect_true_moves_those_same_cells_onto_an_lcc_value(basis_and_clust
     """The other side of the same coin: with reconnect on they take an LCC cell's value."""
     import deltatrace as dt
 
-    basis, clust = basis_and_clust
+    basis, _ = basis_and_clust
     basis.obs["clusters"] = pd.Categorical(
         ["source", "source", "mid", "mid", "sink", "sink", "mid", "mid"]
     )
-    graph = dt.tl.endpoints(basis, basis, ["source"], ["sink"], cluster_key="clusters",
+    graph = dt.tl.endpoints(basis, ["source"], ["sink"], cluster_key="clusters",
                             graph="intr", p_end=0.2, verbose=0)
-    dt.tl.qrot(graph, adata_basis=basis, adata_clust=clust, graph="intr", reconnect=True,
+    dt.tl.qrot(graph, adata=basis, graph="intr", reconnect=True,
                reconnect_graph="expr", verbose=0)
 
     pt = basis.obs["pseudotime"].to_numpy()

@@ -64,8 +64,12 @@ def _is_terminal() -> bool:
 
 def _fmt(seconds: float) -> str:
     if seconds >= 60:
-        m, s = divmod(seconds, 60)
-        return f"{int(m)} m {s:.0f} s"
+        total_sec = round(seconds)
+        m, s = divmod(total_sec, 60)
+        if m >= 60:
+            h, m = divmod(m, 60)
+            return f"{int(h)} h {int(m)} m"
+        return f"{int(m)} m {int(s)} s"
     if seconds >= 1:
         return f"{seconds:.1f} s"
     return f"{seconds:.2f} s"
@@ -158,7 +162,7 @@ def stage(message=None):
     """Decorate a public stage so it logs uniformly.
 
     Reads the decorated function's own ``verbose`` argument (bool or 0/1/2) to control
-    output. ``message=None`` marks a wrapper that only *composes* other stages (``graphs``,
+    output. ``message=None`` marks a wrapper that only *composes* other stages (``integrate``,
     ``trajectory``): it emits no step line of its own, so the output is a flat list of its
     children's steps followed by a single ``done.``. Use the :func:`container` alias to say
     so at the call site. ``message`` may also be a callable that is given the call's bound

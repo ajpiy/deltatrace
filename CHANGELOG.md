@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.3.0
+
+### Changed
+
+- `pp.integrate`: consolidated preprocessing into `dt.pp.integrate` as the unified graph integration entry point.
+- `tl.endpoints`: cleaned parameter signatures and removed legacy `_renamed_kwargs` wrapper and `blocked_flows` argument.
+- `tl.qrot` and `tl.trajectory` default to `tau="auto"`: 0.3 times the cells in the largest connected piece
+  of the graph, the rule selected on the Figure 2 benchmark (it replaces the fixed 100, under which the flow
+  concentrated on few edges in large graphs). Pass `tau=100` for the previous results. `tl.qrot_graph` keeps
+  100 as its default and also accepts `"auto"`. The tau solved at is stored in `uns["dt_flow"]["tau"]` and
+  returned by `qrot_graph` as `"tau"`.
+- `tl.qrot` / `tl.qrot_graph`: each Newton step's linear system is factored by SuperLU unless its factors
+  would be dense, which is counted exactly before factoring (in SuperLU's own ordering); then it is solved by
+  conjugate gradients preconditioned with algebraic multigrid (PyAMG, deterministic). Same flows (to
+  rounding) and KKT conditions. On single-cell kNN graphs at the new tau: 61,819 cells 346 s -> 15 s and
+  2.1 -> 0.5 GB; 30,000 cells 5-8x faster; unchanged where the factors stay sparse (small graphs,
+  tau 100, low-dimensional graphs).
+- `pyamg` is listed as a dependency (MIT).
+- `tl.qrot` / `tl.qrot_graph`: custom Numba-compiled Steihaug--Toint Newton-CG trust-region warm start capped at 100
+  steps with TRON-style inner CG capping (`max_cg=20`), relative dual plateau exit (`ftol=1e-6`), and two-tier
+  radius expansion, running 2-8x faster than SciPy's `minimize` with zero Python callback overhead. Newton
+  runs up to 3000 steps per tau level (was 300), and the Newton line search and per-step residual are compiled
+  with numba.
+- `numba` is listed as a dependency (scanpy already requires it).
+
+### Fixed
+
+- `tl.cluster_trajectory` / `cluster_flux_matrix`: fixed integer overflow bug when cluster count $K \ge 12$
+  where pandas `Categorical.codes` defaulted to signed `int8`, causing negative indexing errors in `np.bincount`.
+- `tl.qrot` no longer fails with "did not converge" on graphs with many disconnected islands or with all costs
+  at the `cost_range` floor and a tiny `tau`: those need more than the old 300 Newton steps per level.
+- `tl.qrot_graph`'s `tau` docstring no longer suggests rescaling `tau` by the total mass.
+
 ## 0.2.0
 
 ### Added

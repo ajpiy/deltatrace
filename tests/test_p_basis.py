@@ -109,9 +109,9 @@ def toy_graph():
     """The toy system's integrated graph. Clusters source/mid/sink, 50 cells each.
 
     Built at the pre-0.1.0 graph defaults (alpha=0.5, p_keep=0.1), spelled out: the quotas
-    and indices pinned below were recorded on this graph, and a change of pp.graphs'
+    and indices pinned below were recorded on this graph, and a change of pp.integrate'
     defaults must not move them."""
-    return dt.pp.graphs(*line_toy(n=150), alpha=0.5, p_keep=0.1, verbose=0)
+    return dt.pp.integrate(*line_toy(n=150), alpha=0.5, p_keep=0.1, verbose=0)
 
 
 def _pool_object(sizes, k=6):
@@ -190,7 +190,7 @@ def _quotas(obj, source_clusters, sink_clusters, **kw):
     kw.setdefault("sampling_mode", "directed")
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        gr = dt.tl.endpoints(obj, obj, source_clusters, sink_clusters,
+        gr = dt.tl.endpoints(obj, source_clusters, sink_clusters,
                              cluster_key="clusters", graph="intr", verbose=2, **kw)
     out = []
     for want in ("Source quotas:", "Sink quotas:"):
@@ -227,7 +227,7 @@ def test_lcc_basis_quotas_are_pinned(toy_graph):
     separately, below.
     """
     for seed, (want_src, want_snk) in QUOTAS.items():
-        gr = dt.tl.endpoints(toy_graph, toy_graph, ["source"], ["mid", "sink"],
+        gr = dt.tl.endpoints(toy_graph, ["source"], ["mid", "sink"],
                              cluster_key="clusters", graph="intr", p_end=0.05,
                              sampling_mode="directed", seed=seed, verbose=0,
                              p_basis="lcc")
@@ -239,7 +239,7 @@ def test_lcc_basis_quotas_are_pinned(toy_graph):
 def test_lcc_basis_sampled_indices_are_pinned(toy_graph):
     """The cells themselves, index for index, so nothing moves them unnoticed."""
     for seed, (want_src, want_snk) in SAMPLED.items():
-        gr = dt.tl.endpoints(toy_graph, toy_graph, ["source"], ["mid", "sink"],
+        gr = dt.tl.endpoints(toy_graph, ["source"], ["mid", "sink"],
                              cluster_key="clusters", graph="intr", p_end=0.05,
                              sampling_mode="directed", seed=seed, verbose=0,
                              p_basis="lcc")
@@ -250,7 +250,7 @@ def test_lcc_basis_sampled_indices_are_pinned(toy_graph):
 def test_lcc_basis_random_mode_quotas_and_indices(toy_graph):
     """Same, with two source clusters and the plain random sampler."""
     for seed in SEEDS:
-        gr = dt.tl.endpoints(toy_graph, toy_graph, ["source", "mid"], ["sink"],
+        gr = dt.tl.endpoints(toy_graph, ["source", "mid"], ["sink"],
                              cluster_key="clusters", graph="intr", p_end=0.05,
                              sampling_mode="random", seed=seed, verbose=0,
                              p_basis="lcc")
@@ -268,7 +268,7 @@ def test_lcc_basis_both_roles_multi_quotas_and_indices(toy_graph):
     stream. Here both do, pinning the source and sink remainder draws together.
     """
     for seed in SEEDS:
-        gr = dt.tl.endpoints(toy_graph, toy_graph, ["source", "mid"], ["mid", "sink"],
+        gr = dt.tl.endpoints(toy_graph, ["source", "mid"], ["mid", "sink"],
                              cluster_key="clusters", graph="intr", p_end=0.05,
                              sampling_mode="directed", seed=seed, verbose=0,
                              p_basis="lcc")
@@ -283,8 +283,8 @@ def test_cluster_is_the_default(toy_graph):
     for seed in SEEDS:
         common = dict(cluster_key="clusters", graph="intr", p_end=0.05,
                       sampling_mode="directed", seed=seed, verbose=0)
-        a = dt.tl.endpoints(toy_graph, toy_graph, ["source"], ["mid", "sink"], **common)
-        b = dt.tl.endpoints(toy_graph, toy_graph, ["source"], ["mid", "sink"],
+        a = dt.tl.endpoints(toy_graph, ["source"], ["mid", "sink"], **common)
+        b = dt.tl.endpoints(toy_graph, ["source"], ["mid", "sink"],
                             p_basis="cluster", **common)
         assert list(a["source_indices"]) == list(b["source_indices"])
         assert list(a["sink_indices"]) == list(b["sink_indices"])
@@ -344,7 +344,7 @@ def test_cluster_basis_floors_tiny_cluster_at_one(pool_object):
     # Under "lcc" the same cluster is asked for the whole role total and cannot supply
     # it, so it is clamped to everything it has rather than refusing.
     with pytest.warns(UserWarning, match="sampling all 3"):
-        gr_lcc = dt.tl.endpoints(pool_object, pool_object, ["A"], ["rare"],
+        gr_lcc = dt.tl.endpoints(pool_object, ["A"], ["rare"],
                                  cluster_key="clusters", graph="intr", p_end=0.10, seed=42,
                                  verbose=0, p_basis="lcc")
     assert len(gr_lcc["sink_indices"]) == 3
@@ -455,7 +455,7 @@ def test_cluster_basis_rounds_half_to_even(pool_object):
 def test_unknown_p_basis_raises_valueerror_naming_both(toy_graph, bad):
     """A misspelling is a caller error, and the message must name both accepted values."""
     with pytest.raises(ValueError) as e:
-        dt.tl.endpoints(toy_graph, toy_graph, ["source"], ["sink"], cluster_key="clusters",
+        dt.tl.endpoints(toy_graph, ["source"], ["sink"], cluster_key="clusters",
                         graph="intr", verbose=0, p_basis=bad)
     msg = str(e.value)
     assert "p_basis" in msg
@@ -475,14 +475,14 @@ def test_bad_p_basis_is_rejected_before_any_work(toy_graph, monkeypatch):
 
     monkeypatch.setattr(_endpoints, "_build_cell_graph", boom)
     with pytest.raises(ValueError, match="p_basis"):
-        dt.tl.endpoints(toy_graph, toy_graph, ["source"], ["sink"], cluster_key="clusters",
+        dt.tl.endpoints(toy_graph, ["source"], ["sink"], cluster_key="clusters",
                         graph="intr", verbose=0, p_basis="nope")
     assert not calls
 
     # Without this the test passes vacuously: the patched builder must be the one
     # endpoints actually calls, so a valid p_basis has to run straight into it.
     with pytest.raises(AssertionError, match="graph was already built"):
-        dt.tl.endpoints(toy_graph, toy_graph, ["source"], ["sink"], cluster_key="clusters",
+        dt.tl.endpoints(toy_graph, ["source"], ["sink"], cluster_key="clusters",
                         graph="intr", verbose=0, p_basis="lcc")
     assert len(calls) == 1
 
@@ -534,7 +534,7 @@ def test_cluster_basis_empty_pool_is_an_error(pool_object):
     """A role cluster with nothing in the LCC cannot be sized, and must not be skipped."""
     obj = _isolated(pool_object, "rare")
     with pytest.raises(ValueError, match=r"none of its 3 cells are in the largest connected"):
-        dt.tl.endpoints(obj, obj, ["A"], ["rare"], cluster_key="clusters",
+        dt.tl.endpoints(obj, ["A"], ["rare"], cluster_key="clusters",
                         graph="intr", p_end=0.10, seed=42, verbose=0,
                         p_basis="cluster")
 
@@ -544,7 +544,7 @@ def test_an_unknown_cluster_label_is_named(pool_object):
     pool, and says which labels exist."""
     obj = pool_object.copy()
     with pytest.raises(ValueError, match=r"\['nosuchcluster'\] not found.*'rare'"):
-        dt.tl.endpoints(obj, obj, ["A"], ["nosuchcluster"], cluster_key="clusters",
+        dt.tl.endpoints(obj, ["A"], ["nosuchcluster"], cluster_key="clusters",
                         graph="intr", p_end=0.10, seed=42, verbose=0)
 
 
@@ -555,7 +555,7 @@ def test_lcc_basis_clamps_a_deficient_cluster_to_its_pool(pool_object):
     """A cluster holding less of the LCC than p_end asks for cannot fill its quota however
     the cells are drawn, so it takes everything it has and says what that costs."""
     with pytest.warns(UserWarning) as rec:
-        gr = dt.tl.endpoints(pool_object, pool_object, ["A"], ["rare"],
+        gr = dt.tl.endpoints(pool_object, ["A"], ["rare"],
                              cluster_key="clusters", graph="intr", p_end=0.10, seed=42,
                              verbose=0, p_basis="lcc")
     msg = str(rec[0].message)
@@ -570,7 +570,7 @@ def test_lcc_basis_does_not_warn_when_every_quota_fits(pool_object):
     """The clamp has to be silent on the ordinary path, or it is just noise."""
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        dt.tl.endpoints(pool_object, pool_object, ["A"], ["C"], cluster_key="clusters",
+        dt.tl.endpoints(pool_object, ["A"], ["C"], cluster_key="clusters",
                         graph="intr", p_end=0.10, seed=42, verbose=0, p_basis="lcc")
 
 
@@ -581,7 +581,7 @@ def test_lcc_basis_clamped_quota_is_monotone_in_p_end(pool_object):
     for p_end in (0.02, 0.05, 0.10, 0.20, 0.30, 0.50, 0.80):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            gr = dt.tl.endpoints(pool_object, pool_object, ["A"], ["rare"],
+            gr = dt.tl.endpoints(pool_object, ["A"], ["rare"],
                                  cluster_key="clusters", graph="intr", p_end=p_end,
                                  seed=42, verbose=0, p_basis="lcc")
         counts.append(len(gr["sink_indices"]))
@@ -593,7 +593,7 @@ def test_lcc_basis_still_refuses_an_empty_pool(pool_object):
     """Clamping to zero is not sampling: nothing in the LCC still has to be an error."""
     obj = _isolated(pool_object, "rare")
     with pytest.raises(ValueError, match=r"only 0 of its 3 are in the largest connected"):
-        dt.tl.endpoints(obj, obj, ["A"], ["rare"], cluster_key="clusters",
+        dt.tl.endpoints(obj, ["A"], ["rare"], cluster_key="clusters",
                         graph="intr", p_end=0.10, seed=42, verbose=0, p_basis="lcc")
 
 

@@ -54,55 +54,69 @@ def lineages(
     verbose: int | bool = 1,
     key_added: str | None = None,
 ) -> dict:
-    """Give every cell its probability of ending in each terminal fate.
+    """Compute cellular fate probabilities using an absorbing Markov chain.
 
-    Builds the absorbing Markov chain from the QROT flow in ``adata.uns[flow_key]``
-    and reads off the absorption probability that a unit of flow leaving cell ``i``
-    ends in lineage ``l`` (unique and decomposition-independent, so a bipotent cell
-    is reported as a split, e.g. 0.67 / 0.33, not committed to one fate).
+    Constructs an absorbing Markov chain from the optimal transport flow in
+    ``adata.uns[flow_key]`` and solves the fundamental absorption system:
 
-    Writes the canonical keys tradeSeq reads (``obsm['path_cellweights']``,
-    ``obsm['path_pseudotime']``, ``obsm['path_flowmass']``) plus ``obs['lineage']``
-    / ``obs['lineage_confidence']`` / ``obs['fate_leakage']`` and one
-    ``obs['fate_<lineage>']`` column per lineage (its absorption probability, for
-    ``scanpy.pl.embedding(color=...)``; a ``/`` in the lineage name becomes ``_``). A cell the flow never
-    reaches is ``"unassigned"`` in ``lineage`` and NaN in the numeric columns.
+        (I - T) A = R
+
+    where `A[i, l]` is the unconditional probability that cell `i` ends in
+    terminal lineage `l`.
+
+    Writes tradeSeq-compatible matrices into ``adata.obsm``:
+    - ``"path_cellweights"``: normalized conditional fate probabilities.
+    - ``"path_pseudotime"``: per-lineage pseudotime matrix.
+    - ``"path_flowmass"``: unconditional flow mass `A`.
+    Also writes ``adata.obs["lineage"]``, ``adata.obs["lineage_confidence"]``,
+    ``adata.obs["fate_leakage"]``, and individual ``adata.obs["fate_<lineage>"]`` columns.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Object QROT wrote into (holds ``uns[flow_key]`` and ``obs[pt_key]``).
+        AnnData holding the solved flow in ``uns[flow_key]`` and pseudotime in ``obs[pt_key]``.
     source_clusters : sequence of str
-        Cluster labels (in ``obs[cluster_key]``) whose cells emit the flow.
+        Progenitor cluster label(s).
     terminal_clusters : sequence of str, optional
-        Terminal (sink) cluster labels. ``None`` runs SOURCE-ONLY discovery: ranks
-        clusters by terminality (see :func:`terminality`) and cuts that ranking by
-        ``omega_term`` or ``n_lineages`` (exactly one required).
-    omega_term : float, optional
-        Terminal cutoff on cluster terminality, ``term_score = 1 - flow_out/flow_in``; used only
-        when ``terminal_clusters is None``. :func:`terminality` suggests a value
-        from the largest gap in the sorted table.
-    n_lineages : int, optional
-        Take the top ``n_lineages`` clusters by terminality instead of a value
-        cutoff. Source-only only, mutually exclusive with ``omega_term``.
+        Terminal cluster label(s). If None, runs source-only discovery using
+        `omega_term` or `n_lineages`.
     cluster_key : str, default "clusters"
-        ``obs`` column holding the cluster labels.
-    flow_key, pt_key : str
-        ``uns`` / ``obs`` keys for the flow and pseudotime.
+        Column in ``adata.obs`` with cluster labels.
+    flow_key : str, optional
+        Key in ``adata.uns`` holding the solved flow.
+    pt_key : str, optional
+        Key in ``adata.obs`` holding pseudotime values.
+    omega_term : float, optional
+        Terminality score threshold for source-only terminal discovery.
+    n_lineages : int, optional
+        Number of top terminal clusters to select in source-only mode.
     edge_threshold : float, default 0
-        Minimum flow for an edge to count; 0 keeps exactly the edges the optimal flow uses.
+        Minimum flow threshold for an edge to be included in the chain.
     verbose : int or bool, default 1
-        Logging verbosity.
+        Verbosity level.
     key_added : str, optional
-        Suffix for the keys read and written, matching the one given to :func:`qrot`.
+        Namespace suffix for written keys.
 
     Returns
     -------
     dict
-        ``"chain"`` (the absorbing chain), ``"A"`` (unconditional absorption per
-        cell and lineage), ``"b"`` (probability of reaching any terminal), ``"F"``
-        (conditional fate, ``A`` renormalized by ``b``), ``"names"`` (lineage
-        names, column order of ``A``).
+        Dictionary containing:
+        - ``"chain"``: absorbing Markov chain dictionary.
+        - ``"A"``: unconditional absorption probability matrix of shape ``(n_cells, n_lineages)``.
+        - ``"b"``: row sums of `A` (probability of reaching any terminal).
+        - ``"F"``: conditional fate matrix normalized by `b`.
+        - ``"names"``: list of lineage names corresponding to columns of `A`.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> dt.tl.qrot(gr, adata=adata)
+    >>> lin = dt.tl.lineages(adata, source_clusters=["progenitor"], terminal_clusters=["fate_A", "fate_B"])
+    >>> "lineage" in adata.obs and "path_cellweights" in adata.obsm
+    True
     """
     _check_terminal_cut(terminal_clusters, omega_term, n_lineages)
     _sfx = _suffix(key_added)
@@ -180,39 +194,49 @@ def terminality(
     key_added: str | None = None,
     show: bool = True,
 ):
-    """Rank clusters by how terminal the flow makes them look.
+    """Rank clusters by net terminality based on cross-cluster flow conservation.
 
-    Scores each cluster by cross-cluster flux, terminality, ``term_score = 1 - flow_out / flow_in``: a
-    cluster that takes flow in and passes none on scores near 1, a progenitor
-    scores strongly negative. Prints the sorted table and suggests the clusters above
-    its largest gap as terminals; pass their number to
-    ``lineages(terminal_clusters=None, n_lineages=...)``, or cut the same ranking by
-    value with ``omega_term=...``.
+    Calculates the terminality score ``eta_k`` for each cluster:
+
+        term_score = 1 - flow_out / flow_in = 1 - phi_out / phi_in
+
+    Clusters with `term_score` near 1 absorb incoming flow without emitting
+    downstream flow (terminal fates, ``eta_k >= omega_term``), whereas
+    progenitor clusters have strongly negative scores.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Object holding the solved flow in ``uns[flow_key]``.
+        AnnData holding the solved flow in ``uns[flow_key]``.
     cluster_key : str, default "clusters"
-        ``obs`` column holding the cluster labels.
+        Column in ``adata.obs`` holding cluster labels.
     source_clusters : sequence of str, optional
-        Progenitor cluster label(s) to drop from the table before the gap search
-        (sources score strongly negative and would otherwise hijack the
-        suggestion). Pass the same value you give :func:`lineages`.
+        Progenitor cluster label(s) to exclude from terminality gap analysis.
     flow_key : str, optional
-        ``uns`` key holding the solved flow. Overrides ``key_added`` when given.
+        Key in ``adata.uns`` holding the flow dictionary.
     edge_threshold : float, default 0
-        Minimum flow for an edge to count; 0 keeps exactly the edges the optimal flow uses.
+        Minimum flow required for an edge to contribute to cross-cluster flux.
     key_added : str, optional
-        Read ``uns['dt_flow_<key_added>']`` instead of the flat ``uns['dt_flow']``.
+        Namespace suffix matching :func:`deltatrace.tl.qrot`.
     show : bool, default True
-        Print the table + suggestion (its own knob, not ``verbose``, since the
-        table is this function's product). The DataFrame is returned regardless.
+        Whether to print the summary ranking table and suggested terminal cut.
 
     Returns
     -------
     pandas.DataFrame
-        Sorted by ``term_score`` descending; columns ``flow_in``, ``flow_out``, ``absorbed``, ``term_score`` (terminality).
+        DataFrame indexed by cluster name, sorted by ``term_score`` descending,
+        with columns: ``flow_in``, ``flow_out``, ``absorbed``, and ``term_score``.
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, source_clusters=["progenitor"])
+    >>> dt.tl.qrot(gr, adata=adata)
+    >>> df = dt.tl.terminality(adata, source_clusters=["progenitor"], show=False)
+    >>> "term_score" in df.columns
+    True
     """
 
     flow_key = flow_key or f"dt_flow{_suffix(key_added)}"
@@ -234,41 +258,52 @@ def terminality(
 
 def widest_path(adata, src, dst, *, flow_key: str | None = None,
                 edge_threshold: float = 0, key_added: str | None = None):
-    """Trace the highest-capacity route from one cell to another through the flow.
+    """Find the highest-capacity bottleneck path between two cells through the flow.
 
-    Returns the ``src`` -> ``dst`` path whose thinnest edge is as thick as possible
-    (max-bottleneck / "widest" path), over edges carrying more than
-    ``edge_threshold``. Not a pipeline stage: :func:`lineages` assigns fates
-    without building a path, so use this only for an explicit route between two
-    cells.
+    Computes the maximum-capacity (widest bottleneck) path maximizing the minimum
+    flow edge along the path from cell `src` to cell `dst`.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Object holding the solved flow in ``uns[flow_key]``.
-    src, dst : int
-        Row indices of the start and end cell in ``adata``.
+        AnnData holding the solved flow in ``uns[flow_key]``.
+    src : int
+        Index of the start cell.
+    dst : int
+        Index of the destination cell.
     flow_key : str, optional
-        ``uns`` key of the flow written by :func:`qrot`. Overrides ``key_added``
-        when given.
+        Key in ``adata.uns`` holding the flow dictionary.
     edge_threshold : float, default 0
-        Minimum flow for an edge to count; 0 keeps exactly the edges the optimal flow uses.
+        Minimum flow threshold for an edge to be traversable.
     key_added : str, optional
-        Namespace of the run to trace, matching the one given to :func:`qrot`.
+        Namespace suffix matching :func:`deltatrace.tl.qrot`.
 
     Returns
     -------
     path : list of int
-        Cell indices along the route, empty when ``dst`` is unreachable.
+        Cell indices along the path from `src` to `dst` (empty if unreachable).
     capacity : float
-        Flow on the route's thinnest edge, 0.0 if there is no route.
+        Flow capacity of the bottleneck edge (0.0 if no path exists).
+
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> dt.tl.qrot(gr, adata=adata)
+    >>> src_idx = gr["source_indices"][0]
+    >>> dst_idx = gr["sink_indices"][0]
+    >>> path, cap = dt.tl.widest_path(adata, src_idx, dst_idx)
+    >>> isinstance(path, list) and cap >= 0.0
+    True
     """
 
     flow_key = flow_key or f"dt_flow{_suffix(key_added)}"
     fl = adata.uns.get(flow_key)
     if fl is None:
         raise ValueError(
-            f"No flow data in adata.uns['{flow_key}']. Run qrot() with adata_basis set "
+            f"No flow data in adata.uns['{flow_key}']. Run qrot() with adata set "
             f"(and the same key_added) first."
         )
     E = np.asarray(fl["edges"], np.int64).reshape(-1, 2)   # an edgeless flow stores shape (0,)
@@ -562,7 +597,7 @@ def terminal_cells(adata, chain, cluster_key, terminal_clusters, q_quantile=0.0)
     for c in terminal_clusters:
         m = (lab == c) & chain["live"]
         if q_quantile > 0:
-            thr = np.quantile(chain["q"][m], q_quantile)
+            thr = np.quantile(chain["q"][m], q_quantile) if m.any() else 0.0
             m &= chain["q"] >= thr
         out[c] = np.where(m)[0]
     return out
@@ -609,16 +644,20 @@ def cluster_flux_matrix(adata, cluster_key, cluster_names, flow_key="dt_flow",
     index : dict of {str: int}
         Label to row/column position.
     """
+    import pandas as pd
     names = [str(c) for c in cluster_names]
     index = {c: i for i, c in enumerate(names)}
     K = len(names)
-    df = _cross_cluster_flux(adata, cluster_key, flow_key=flow_key,
-                             edge_threshold=edge_threshold)
-    d = df[(df["src"].isin(index) & df["dst"].isin(index)).to_numpy()]
-    ci = d["src"].map(index).to_numpy(np.int64)
-    cj = d["dst"].map(index).to_numpy(np.int64)
-    # astype: bincount of no edges comes back int64
-    F = np.bincount(ci * K + cj, weights=d["j"].to_numpy(float),
+    fl = adata.uns[flow_key]
+    J = np.asarray(fl["J"], float).ravel()
+    E = np.asarray(fl["edges"], np.int64)
+    k = J > edge_threshold
+    cat = pd.Categorical(adata.obs[cluster_key].astype(str), categories=names)
+    codes = cat.codes.astype(np.int64)
+    cu = codes[E[k, 0]]
+    cv = codes[E[k, 1]]
+    valid = (cu >= 0) & (cv >= 0) & (cu != cv)
+    F = np.bincount(cu[valid] * K + cv[valid], weights=J[k][valid],
                     minlength=K * K).reshape(K, K).astype(float, copy=False)
     return F, index
 
@@ -1002,7 +1041,7 @@ def _widest_path(chain, JL_edges, JL, src_idx, dst_idx):
             best = v; break
         for i in range(ptr[v], ptr[v + 1]):
             u = nbr[i]; nc = min(c, wt[i])
-            if nc > cap[u] + EPS:
+            if nc > cap[u]:
                 cap[u] = nc; prev[u] = v; heapq.heappush(h, (-nc, u))
     if best < 0:
         return [], 0.0
@@ -1119,93 +1158,70 @@ def cluster_trajectory(
     key_added: str | None = None,
     verbose: int | bool = 1,
 ) -> dict:
-    """Abstract the cell-level flow into a directed graph over clusters.
+    """Construct a directed coarse-grained trajectory graph over clusters.
 
-    One node per cluster, a candidate edge wherever net mass crosses a cluster boundary:
+    Aggregates cell-level transport flow `J` across cluster boundaries into gross
+    and net cross-cluster fluxes (``Phi`` and ``Phi_net = (Phi - Phi.T)_+``):
 
-        F[i,j] = sum of J over active edges from cluster i to cluster j
-        NET    = F - F.T                       net flux, antisymmetric
-        M      = 0.5 * sum_i |sum_j NET[i,j]|  total transported mass
-        candidate i -> j  iff  NET[i,j] > 0
+        F[i, j] = sum of J over active edges from cluster i to cluster j
+        NET     = F - F.T
 
-    Edges are oriented by the sign of NET, not by comparing pseudotimes, so the
-    arrows are the transport itself. The candidates are then reduced in four steps:
-
-    1. leak prune: a cluster with ``out_flux/in_flux < term_tol`` retains most of what
-       reaches it, so its outgoing candidates are spillover and are dropped wherever
-       the target keeps another incoming candidate;
-    2. simplification: with ``simplify=True`` (default) the minimum equivalent graph of
-       the survivors (``edge_rule="meg"``: every edge another path already implies is
-       dropped, however much flux it carries) or the mass cutoff
-       ``NET[i,j] >= theta * M`` (``edge_rule="theta"``); ``simplify=False`` stops after
-       the prune and keeps every surviving candidate;
-    3. repair: dropped candidates that merge components are re-admitted heaviest first;
-    4. acyclicity guard: summing flow over a cluster boundary can introduce cycles even
-       though the cell-level flow is a DAG, so edges enter heaviest first and any that
-       would close one is reversed (counted in ``n_cycle_flips``). Pass
-       ``enforce_acyclic=False`` for a genuinely cyclic population, so a real cycle is
-       kept as one instead of broken.
+    Directed edges are formed where ``NET[i, j] > 0``, followed by:
+    1. Leak pruning: removes spurious outflows from near-terminal clusters.
+    2. Simplification: applies minimum equivalent graph (``"meg"``) or flux threshold (``"theta"``).
+    3. Component repair: ensures graph connectivity is preserved.
+    4. Acyclicity enforcement: resolves cycles by flipping backwards-oriented edges.
 
     Parameters
     ----------
     adata : anndata.AnnData
-        Object QROT wrote into, holding ``uns[flow_key]``, the labels in
-        ``obs[cluster_key]`` and (optionally) ``obs[pt_key]``.
+        AnnData holding the solved flow in ``uns[flow_key]`` and cluster labels in ``obs[cluster_key]``.
     cluster_key : str, default "clusters"
-        ``obs`` column holding the cluster labels.
+        Column in ``adata.obs`` with cluster labels.
     flow_key : str, optional
-        ``uns`` key of the flow written by :func:`qrot`. Overrides ``key_added``
-        when given.
+        Key in ``adata.uns`` holding the flow dictionary.
     edge_rule : {"meg", "theta"}, default "meg"
-        Simplification rule (step 2); read only when ``simplify`` is True.
+        Graph simplification rule (minimum equivalent graph or flux threshold).
     theta : float, default 0.05
-        Under ``edge_rule="theta"``, the edge cutoff as a fraction of the transported
-        mass M, strictly inside ``(0, 1)``. Ignored under ``"meg"``.
+        Flux threshold fraction of total mass `M` when `edge_rule="theta"`.
     term_tol : float or None, default 0.40
-        Leak-prune ratio (step 1). ``None`` disables the prune.
+        Leak prune outflow/inflow ratio threshold.
     simplify : bool, default True
-        Run step 2. ``False`` gives the leak prune alone, followed by steps 3 and 4.
+        Whether to perform edge simplification.
     edge_threshold : float, default 1e-6
-        Minimum flow, as a fraction of the transported mass (supplies sum to 1), for an edge to count.
+        Minimum edge flow cutoff.
     enforce_acyclic : bool, default True
-        Break cluster-level cycles by reversing the closing edge. Set ``False`` to
-        keep every kept edge in its raw NET-sign direction instead --
-        ``n_cycle_flips``/``n_cycle_unresolved`` are then always 0.
+        Whether to break cluster-level cycles.
     repair : bool, default True
-        Re-admit dropped candidates that merge components, so simplification cannot
-        disconnect the graph and orphan a cluster's cells. Under ``"theta"`` the cutoff
-        is then no longer literal. Counted in ``n_repair_edges_added``.
+        Whether to reconnect disconnected components.
     pt_key : str, optional
-        ``obs`` column with the pseudotime, used only to color nodes and run the
-        median-inversion check, never to orient an edge. Missing pseudotime
-        disables both rather than raising.
+        Column in ``adata.obs`` with pseudotime values.
     key_added : str, optional
-        Namespace of the run, matching the one given to :func:`qrot`. Result is
-        written to ``uns['dt_cluster_trajectory<_key_added>']``.
+        Namespace suffix matching :func:`deltatrace.tl.qrot`.
     verbose : int or bool, default 1
-        Logging verbosity.
+        Verbosity level.
 
     Returns
     -------
     dict
-        Also written to ``uns['dt_cluster_trajectory<_key_added>']``:
+        Dictionary containing cluster graph summary:
+        - ``"names"``: list of cluster names.
+        - ``"net_flux"``: (K, K) net flux matrix.
+        - ``"edges"``: pandas.DataFrame of retained directed edges.
+        - ``"throughput"``, ``"in_flux"``, ``"out_flux"``: per-cluster flux arrays.
+        - ``"cluster_pt"``: median pseudotime per cluster.
+        Also stored in ``adata.uns["dt_cluster_trajectory"]``.
 
-        - ``"names"``: clusters, sorted; indexes every array below.
-        - ``"net_flux"``: ``(K, K)`` NET matrix.
-        - ``"edges"``: retained directed edges as a DataFrame (``src``/``dst``,
-          ``i``/``j``, ``weight``, ``frac``, ``flipped``).
-        - ``"throughput"``, ``"in_flux"``, ``"out_flux"``: ``(K,)`` per-cluster flux.
-        - ``"cluster_pt"``: ``(K,)`` median pseudotime; NaN where undefined.
-        - ``"M"``, ``"theta"``, ``"simplify"``, ``"enforce_acyclic"``: transported
-          mass, cutoff, and whether simplification and the acyclicity guard ran.
-        - ``"n_cycle_flips"``, ``"n_cycle_unresolved"``: acyclicity guard counters.
-        - ``"n_median_inverted"``: retained edges running backwards in the raw NET
-          orientation before the guard ran; ``-1`` if no cluster had a finite median.
-        - ``"n_candidate_pairs"``, ``"n_leak_pruned"``, ``"n_pruned_by_theta"``
-          (candidates dropped by steps 1 and 2 together), ``"n_repair_edges_added"``,
-          ``"n_zero_flux_clusters"``, ``"n_components"``, ``"M_fallback"``:
-          candidate/pruned/re-admitted pair counts, zero-flux cluster count,
-          connected components, and whether M fell back off the conservation law.
+    Examples
+    --------
+    >>> import deltatrace as dt
+    >>> adata, adata_dist = dt.datasets.crypt()
+    >>> adata = dt.pp.integrate(adata, adata_dist=adata_dist)
+    >>> gr = dt.tl.endpoints(adata, ["progenitor"], ["fate_A", "fate_B"])
+    >>> dt.tl.qrot(gr, adata=adata)
+    >>> cg = dt.tl.cluster_trajectory(adata)
+    >>> "edges" in cg and "net_flux" in cg
+    True
     """
 
     _sfx = _suffix(key_added)
@@ -1222,7 +1238,7 @@ def cluster_trajectory(
     theta_f = float(theta)
     if adata.uns.get(flow_key) is None:
         raise ValueError(
-            f"No flow data in adata.uns['{flow_key}']. Run qrot() with adata_basis set "
+            f"No flow data in adata.uns['{flow_key}']. Run qrot() with adata set "
             f"(and the same key_added) first."
         )
 

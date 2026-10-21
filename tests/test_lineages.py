@@ -134,9 +134,9 @@ def test_offpath_cells_do_not_inflate_the_mean_leakage():
 def test_fate_leakage_matches_lineage_confidence_on_the_stock_toy():
     """The same contract end to end, on the stock toy (at the pre-0.1.0
     defaults, spelled out so the known off-path count below stays meaningful)."""
-    ad_g = dt.pp.graphs(*line_toy(n=150), alpha=0.5, p_keep=0.1, verbose=0)
+    ad_g = dt.pp.integrate(*line_toy(n=150), alpha=0.5, p_keep=0.1, verbose=0)
     dt.tl.trajectory(ad_g, ["source"], ["sink"], basis="spatial", verbose=0, p_end=0.01,
-                     p_basis="lcc", sampling_mode="directed")
+                     p_basis="lcc", sampling_mode="directed", tau=100)
 
     leak = ad_g.obs["fate_leakage"].to_numpy(float)
     conf = ad_g.obs["lineage_confidence"].to_numpy(float)

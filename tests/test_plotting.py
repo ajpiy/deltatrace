@@ -5,6 +5,9 @@ and are cheap to regress: the caller's AnnData is not mutated, a supplied ``ax``
 one drawn on and saved, and the legend survives source-only mode (no sinks).
 """
 
+import copy
+import pickle
+
 import matplotlib
 import numpy as np
 import pytest
@@ -19,7 +22,7 @@ import deltatrace as dt
 @pytest.fixture(scope="module")
 def run():
     """A finished trajectory on the toy, plus the endpoints dict pl.endpoints needs."""
-    ad_g = dt.pp.graphs(*line_toy(n=120), alpha=0.9, p_keep=0.3, verbose=0)
+    ad_g = dt.pp.integrate(*line_toy(n=120), alpha=0.9, p_keep=0.3, verbose=0)
     res = dt.tl.trajectory(ad_g, ["source"], ["sink"], basis="spatial",
                            p_end=0.2, verbose=0)
     return ad_g, res["endpoints"]
@@ -124,7 +127,7 @@ def test_endpoints_does_not_mutate_the_callers_object(run):
     """The scratch category and scanpy's derived color map must not survive the call."""
     ad_g, graph = run
     before_obs, before_uns = set(ad_g.obs.columns), set(ad_g.uns)
-    dt.pl.endpoints(graph, ad_g, basis="spatial", graph="intr", show=False)
+    dt.pl.endpoints(ad_g, graph, basis="spatial", graph="intr", show=False)
     assert set(ad_g.obs.columns) == before_obs
     assert set(ad_g.uns) == before_uns
     assert "_endpoint_class" not in ad_g.obs
@@ -143,7 +146,7 @@ def test_endpoints_never_calls_scanpy(run, monkeypatch):
 
     monkeypatch.setattr(sc.pl, "embedding", boom)
     before = (set(ad_g.obs.columns), set(ad_g.obsm), set(ad_g.uns))
-    _, ax = dt.pl.endpoints(graph, ad_g, basis="spatial", graph="intr", show=False)
+    _, ax = dt.pl.endpoints(ad_g, graph, basis="spatial", graph="intr", show=False)
     assert (set(ad_g.obs.columns), set(ad_g.obsm), set(ad_g.uns)) == before
     from matplotlib.collections import PathCollection
 
@@ -158,7 +161,7 @@ def test_endpoints_background_uses_class_colors(run):
     from matplotlib.colors import to_rgba
 
     ad_g, graph = run
-    _, ax = dt.pl.endpoints(graph, ad_g, basis="spatial", graph="intr", show=False,
+    _, ax = dt.pl.endpoints(ad_g, graph, basis="spatial", graph="intr", show=False,
                             source_color="#112233", show_edges=False)
     src = set(graph["source_indices"])
     src_pts = ad_g.obsm["spatial"][sorted(src)]
@@ -175,10 +178,10 @@ def test_endpoints_legend_survives_source_only(run):
     permutation raised IndexError on the two that exist."""
     ad_g, _ = run
     obj = ad_g.copy()
-    graph = dt.tl.endpoints(obj, obj, ["source"], None, cluster_key="clusters",
+    graph = dt.tl.endpoints(obj, ["source"], None, cluster_key="clusters",
                             graph="intr", p_end=0.2, verbose=0)
     assert graph["sink_indices"] == []
-    _, ax = dt.pl.endpoints(graph, obj, basis="spatial", graph="intr", show=False)
+    _, ax = dt.pl.endpoints(obj, graph, basis="spatial", graph="intr", show=False)
     labels = [t.get_text() for t in ax.get_legend().get_texts()]
     assert "sink" not in labels
     assert "source" in labels
@@ -186,7 +189,7 @@ def test_endpoints_legend_survives_source_only(run):
 
 def test_endpoints_legend_is_ordered_source_intermediate_sink(run):
     ad_g, graph = run
-    _, ax = dt.pl.endpoints(graph, ad_g, basis="spatial", graph="intr", show=False)
+    _, ax = dt.pl.endpoints(ad_g, graph, basis="spatial", graph="intr", show=False)
     labels = [t.get_text() for t in ax.get_legend().get_texts()]
     assert labels == ["source", "intermediate", "sink"]
 
@@ -199,7 +202,7 @@ def test_no_plot_function_leaves_stray_axes(run):
     dt.pl.pseudotime(ad_g, basis="spatial", show=False)
     assert len(plt.get_fignums()) == 1
     plt.close("all")
-    dt.pl.endpoints(graph, ad_g, basis="spatial", graph="intr", show=False)
+    dt.pl.endpoints(ad_g, graph, basis="spatial", graph="intr", show=False)
     assert len(plt.get_fignums()) == 1
 
 
@@ -341,7 +344,7 @@ def multi_lineage():
                  np.where(t < 2 / 3, "mid",
                           np.where(i % 3 == 0, "A", np.where(i % 3 == 1, "B", "C"))))
     )
-    g = dt.pp.graphs(adata, adata_dist, alpha=0.9, p_keep=0.3, verbose=0)
+    g = dt.pp.integrate(adata, adata_dist, alpha=0.9, p_keep=0.3, verbose=0)
     dt.tl.trajectory(g, ["source"], ["A", "B", "C"], basis="spatial",
                      p_end=0.2, verbose=0)
     return g
@@ -499,9 +502,9 @@ def test_endpoints_coord_scale_reaches_the_background_cells(run):
     background once went through sc.pl.embedding and stayed at 1x)."""
     ad_g, graph = run
     s = 4.0
-    _, ax1 = dt.pl.endpoints(graph, ad_g, basis="spatial", graph="intr", coord_scale=1.0,
+    _, ax1 = dt.pl.endpoints(ad_g, graph, basis="spatial", graph="intr", coord_scale=1.0,
                              show=False)
-    _, axs = dt.pl.endpoints(graph, ad_g, basis="spatial", graph="intr", coord_scale=s,
+    _, axs = dt.pl.endpoints(ad_g, graph, basis="spatial", graph="intr", coord_scale=s,
                              show=False)
 
     def _all_points(ax):
@@ -519,7 +522,7 @@ def test_endpoints_falls_back_to_a_spring_layout_when_the_basis_is_missing(run):
 
     ad_g, graph = run
     with pytest.warns(UserWarning, match="spring layout") as rec:
-        fig, ax = dt.pl.endpoints(graph, ad_g, basis="no_such_basis", graph="intr", show=False)
+        fig, ax = dt.pl.endpoints(ad_g, graph, basis="no_such_basis", graph="intr", show=False)
     assert rec[0].filename == __file__                  # said, and pointed at the caller
     assert fig is not None
     pts = np.vstack([np.asarray(c.get_offsets(), float) for c in ax.collections])
@@ -542,9 +545,9 @@ def test_endpoints_fallback_honors_coord_scale(run):
     ad_g, graph = run
     s = 5.0
     with pytest.warns(UserWarning, match="spring layout"):
-        _, ax1 = dt.pl.endpoints(graph, ad_g, basis="no_such_basis", graph="intr",
+        _, ax1 = dt.pl.endpoints(ad_g, graph, basis="no_such_basis", graph="intr",
                                  coord_scale=1.0, show=False)
-        _, axs = dt.pl.endpoints(graph, ad_g, basis="no_such_basis", graph="intr",
+        _, axs = dt.pl.endpoints(ad_g, graph, basis="no_such_basis", graph="intr",
                                  coord_scale=s, show=False)
     p1 = np.vstack([np.asarray(c.get_offsets(), float) for c in ax1.collections])
     ps = np.vstack([np.asarray(c.get_offsets(), float) for c in axs.collections])
@@ -559,7 +562,7 @@ def test_endpoints_basis_none_finds_the_tissue(run):
     ad_g, graph = run
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        _, ax = dt.pl.endpoints(graph, ad_g, graph="intr", show=False)
+        _, ax = dt.pl.endpoints(ad_g, graph, graph="intr", show=False)
     pts = np.vstack([np.asarray(c.get_offsets(), float) for c in ax.collections])
     xy = np.asarray(ad_g.obsm["spatial"], float)
     assert {tuple(np.round(p, 9)) for p in xy} <= {tuple(np.round(p, 9)) for p in pts}
@@ -570,5 +573,31 @@ def test_endpoints_titles_the_graph_it_was_sampled_on_even_with_two_stored(run):
     """pl.endpoints reads the graph from the endpoints result, so an object holding both
     'expr' and 'intr' needs no graph= just to title the plot."""
     ad_g, graph = run
-    _, ax = dt.pl.endpoints(graph, ad_g, basis="spatial", show=False)
+    _, ax = dt.pl.endpoints(ad_g, graph, basis="spatial", show=False)
     assert ax.get_title() == "Endpoints: intr"
+
+
+def test_plot_result_copy_and_pickle():
+    from deltatrace._plotting import _PlotResult
+
+    fig, ax = plt.subplots()
+    res = _PlotResult(fig, ax)
+    assert res.fig is fig
+    assert res.ax is ax
+    assert len(res) == 2
+
+    c = copy.copy(res)
+    assert isinstance(c, _PlotResult)
+    assert c.fig is fig and c.ax is ax
+
+    dc = copy.deepcopy(res)
+    assert isinstance(dc, _PlotResult)
+    assert len(dc) == 2
+
+    dumped = pickle.dumps(res)
+    loaded = pickle.loads(dumped)
+    assert isinstance(loaded, _PlotResult)
+    assert len(loaded) == 2
+    plt.close(fig)
+    plt.close(dc.fig)
+    plt.close(loaded.fig)

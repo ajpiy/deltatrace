@@ -53,12 +53,12 @@ SOURCES = [0, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 18, 20, 21, 22, 26, 28, 29]
 def alpha_graphs():
     """One toy graph per alpha. The edge set is identical across them; only costs move.
     p_keep=0.1 (the pre-0.1.0 default) is spelled out: PRECHANGE_SINKS were recorded on it."""
-    return {a: dt.pp.graphs(*line_toy(n=300), alpha=a, p_keep=0.1, verbose=0)
+    return {a: dt.pp.integrate(*line_toy(n=300), alpha=a, p_keep=0.1, verbose=0)
             for a in ALPHAS}
 
 
 def _sample(obj, metric):
-    gr = dt.tl.endpoints(obj, obj, ["source"], ["sink"], cluster_key="clusters",
+    gr = dt.tl.endpoints(obj, ["source"], ["sink"], cluster_key="clusters",
                          graph="intr", sampling_mode="directed", p_end=0.06,
                          seed=42, directed_metric=metric, verbose=0, p_basis="lcc")
     return sorted(map(int, gr["sink_indices"])), sorted(map(int, gr["source_indices"]))
@@ -165,7 +165,7 @@ def _sink_center(obj, seed):
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        gr = dt.tl.endpoints(obj, obj, ["source"], ["sink"], cluster_key="clusters",
+        gr = dt.tl.endpoints(obj, ["source"], ["sink"], cluster_key="clusters",
                              graph="intr", p_end=0.02, seed=seed, verbose=2,
                              sampling_mode={"source": "random", "sink": "centered"})
     lines = [ln for ln in buf.getvalue().splitlines() if "Sink center for" in ln]
@@ -211,7 +211,7 @@ def test_directed_metric_is_sink_only(alpha_graphs):
     def both(mode):
         out = {}
         for m in ("cost", "hops"):
-            gr = dt.tl.endpoints(obj, obj, ["source"], ["sink"], cluster_key="clusters",
+            gr = dt.tl.endpoints(obj, ["source"], ["sink"], cluster_key="clusters",
                                  graph="intr", sampling_mode=mode, p_end=0.06,
                                  seed=42, directed_metric=m, verbose=0)
             out[m] = (sorted(map(int, gr["source_indices"])),
@@ -228,35 +228,13 @@ def test_directed_metric_is_sink_only(alpha_graphs):
     assert live["cost"][0] == live["hops"][0], "directed_metric leaked into source sampling"
 
 
-def test_blocked_flows_does_not_move_the_endpoints(alpha_graphs):
-    """``blocked_flows`` reprices edges after sampling, so it cannot move the endpoints.
-
-    The parameter docstring says so explicitly; this pins it under both metrics.
-    """
-    obj = alpha_graphs[0.5]
-    blocked = [("sink", "mid"), ("mid", "source"), ("sink", "source")]
-
-    def go(metric, bf):
-        gr = dt.tl.endpoints(obj, obj, ["source"], ["sink"], cluster_key="clusters",
-                             graph="intr", sampling_mode="directed", p_end=0.06,
-                             seed=42, directed_metric=metric, blocked_flows=bf, verbose=0)
-        return ((sorted(map(int, gr["source_indices"])),
-                 sorted(map(int, gr["sink_indices"]))), float(gr["cost_vec"].sum()))
-
-    for metric in ("cost", "hops"):
-        plain_ep, plain_cost = go(metric, None)
-        blocked_ep, blocked_cost = go(metric, blocked)
-        assert plain_ep == blocked_ep, f"blocked_flows moved the endpoints ({metric})"
-        # And it did reach the costs, so the equality above is not a dead comparison.
-        assert plain_cost != blocked_cost, f"blocked_flows never applied ({metric})"
-
 
 @pytest.mark.parametrize("bad", ["hop", "Cost", "dijkstra", ""])
 def test_unknown_directed_metric_raises_value_error(alpha_graphs, bad):
     """A misspelled metric is a caller error, named as such, whatever the sampling mode."""
     obj = alpha_graphs[0.5]
     with pytest.raises(ValueError, match=r"directed_metric") as exc:
-        dt.tl.endpoints(obj, obj, ["source"], ["sink"], cluster_key="clusters",
+        dt.tl.endpoints(obj, ["source"], ["sink"], cluster_key="clusters",
                         graph="intr", sampling_mode="directed", p_end=0.06,
                         directed_metric=bad, verbose=0)
     msg = str(exc.value)
@@ -328,7 +306,7 @@ def test_medoid_survives_a_third_party_draw_mid_call(big_cluster, monkeypatch):
 
 def test_trajectory_forwards_directed_metric():
     """trajectory hands directed_metric to endpoints rather than dropping it."""
-    obj = dt.pp.graphs(*line_toy(n=300), alpha=0.5, verbose=0)
+    obj = dt.pp.integrate(*line_toy(n=300), alpha=0.5, verbose=0)
     got = {}
     for metric in ("cost", "hops"):
         a = obj.copy()

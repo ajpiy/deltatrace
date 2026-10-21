@@ -18,7 +18,7 @@ RUN_KEYS_UNS = ("dt_flow", "dt_grid", "dt_raw_arrows", "path_lineages")
 
 @pytest.fixture(scope="module")
 def graphed():
-    return dt.pp.graphs(*line_toy(n=120, marker_noise=0.0),
+    return dt.pp.integrate(*line_toy(n=120, marker_noise=0.0),
                         alpha=0.9, p_keep=0.3, verbose=False)
 
 
@@ -100,9 +100,9 @@ def test_default_writes_legacy_flat_keys(graphed):
 def test_stagewise_calls_accept_key_added(graphed):
     """The stages must be drivable by hand with the same namespacing."""
     obj = graphed.copy()
-    gr = dt.tl.endpoints(obj, obj, ["source"], ["sink"], cluster_key="clusters",
+    gr = dt.tl.endpoints(obj, ["source"], ["sink"], cluster_key="clusters",
                          graph="intr", p_end=0.2, verbose=False)
-    dt.tl.qrot(gr, adata_basis=obj, adata_clust=obj, graph="intr", verbose=False,
+    dt.tl.qrot(gr, adata=obj, graph="intr", verbose=False,
                key_added="hand")
     dt.tl.compute_velocity_grid(obj, basis="spatial", verbose=False, key_added="hand")
     dt.tl.lineages(obj, ["source"], ["sink"], cluster_key="clusters", verbose=False,

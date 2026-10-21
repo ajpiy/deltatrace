@@ -3,7 +3,8 @@ same values the stages use when called by hand (``basis`` aside: only ``trajecto
 its embedding itself).
 
 Benchmarked for the intersection graph (scRNA-seq with a paired ST section): alpha 0.3,
-p_keep 0.3, p_end 0.15, p_basis "cluster", centered sampling, tau 100.
+p_keep 0.3, p_end 0.15, p_basis "cluster", centered sampling, tau "auto" (0.3 x cells in the largest
+connected piece).
 """
 
 import inspect
@@ -22,7 +23,7 @@ def _defaults(fn, names):
 
 
 def test_graph_defaults_are_the_benchmarked_ones():
-    for fn in (dt.pp.integrate, dt.pp.graphs):
+    for fn in (dt.pp.integrate,):
         assert _defaults(fn, ["alpha", "p_keep"]) == {"alpha": 0.3, "p_keep": 0.3}
 
 
@@ -44,16 +45,21 @@ def test_trajectory_forwards_the_stage_defaults_unchanged():
     assert _defaults(dt.tl.lineages, ["cluster_key"]) == {"cluster_key": "clusters"}
 
 
+def test_qrot_defaults_to_auto_tau():
+    assert _defaults(dt.tl.qrot, ["tau"]) == {"tau": "auto"}
+    assert _defaults(dt.tl.qrot_graph, ["tau"]) == {"tau": 100}
+
+
 def test_wasserstein_uses_every_core_by_default():
     assert _defaults(dt.pp.wasserstein, ["n_jobs"]) == {"n_jobs": -1}
 
 
 def test_the_readme_call_runs_on_the_toy_at_defaults():
-    """pp.graphs -> tl.trajectory -> pl.pseudotime with nothing but the required
+    """pp.integrate -> tl.trajectory -> pl.pseudotime with nothing but the required
     arguments: the basis is found (obsm['spatial']) and every declared fate is reached."""
     import matplotlib
     matplotlib.use("Agg")
-    g = dt.pp.graphs(*line_toy(n=150), verbose=0)
+    g = dt.pp.integrate(*line_toy(n=150), verbose=0)
     dt.tl.trajectory(g, ["source"], ["sink"], verbose=0)
     assert g.uns["dt_grid"]["basis"] == "spatial"
     assert np.isfinite(g.obs["pseudotime"].to_numpy(float)).all()
@@ -66,21 +72,21 @@ def test_the_readme_call_runs_on_the_toy_at_defaults():
 # --------------------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def toy_graph():
-    return dt.pp.graphs(*line_toy(n=150), alpha=0.5, p_keep=0.1, verbose=0)
+    return dt.pp.integrate(*line_toy(n=150), alpha=0.5, p_keep=0.1, verbose=0)
 
 
 def test_a_sampling_dict_with_an_unknown_role_is_an_error(toy_graph):
     a = toy_graph.copy()
     with pytest.raises(ValueError, match="'source' and/or 'sink'"):
-        dt.tl.endpoints(a, a, ["source"], ["sink"], cluster_key="clusters", graph="intr",
+        dt.tl.endpoints(a, ["source"], ["sink"], cluster_key="clusters", graph="intr",
                         sampling_mode={"sinks": "random"}, verbose=0)
 
 
 def test_a_role_missing_from_a_sampling_dict_is_centered(toy_graph):
     kw = dict(cluster_key="clusters", graph="intr", p_end=0.10, seed=5, verbose=0)
     a, b = toy_graph.copy(), toy_graph.copy()
-    full = dt.tl.endpoints(a, a, ["source"], ["sink"], sampling_mode="centered", **kw)
-    part = dt.tl.endpoints(b, b, ["source"], ["sink"], sampling_mode={}, **kw)
+    full = dt.tl.endpoints(a, ["source"], ["sink"], sampling_mode="centered", **kw)
+    part = dt.tl.endpoints(b, ["source"], ["sink"], sampling_mode={}, **kw)
     assert full["source_cells"] == part["source_cells"]
     assert full["sink_cells"] == part["sink_cells"]
 
@@ -91,7 +97,7 @@ def test_a_role_missing_from_a_sampling_dict_is_centered(toy_graph):
 def test_a_zero_sink_quota_warns_and_names_the_way_out(toy_graph):
     a = toy_graph.copy()
     with pytest.warns(UserWarning, match="will have empty lineages") as rec:
-        gr = dt.tl.endpoints(a, a, ["source"], ["mid", "sink"], cluster_key="clusters",
+        gr = dt.tl.endpoints(a, ["source"], ["mid", "sink"], cluster_key="clusters",
                              graph="intr", p_end=0.005, seed=42, verbose=0, p_basis="lcc")
     msg = str(rec[0].message)
     assert "p_basis='cluster'" in msg
@@ -110,7 +116,7 @@ def test_a_zero_quota_warning_points_at_the_caller_through_trajectory(toy_graph)
 def test_a_zero_source_quota_warns_without_lineage_talk(toy_graph):
     a = toy_graph.copy()
     with pytest.warns(UserWarning, match=r"get none\. Raise p_end") as rec:
-        dt.tl.endpoints(a, a, ["source", "mid"], ["sink"], cluster_key="clusters",
+        dt.tl.endpoints(a, ["source", "mid"], ["sink"], cluster_key="clusters",
                         graph="intr", p_end=0.005, seed=42, verbose=0, p_basis="lcc")
     assert "source cluster" in str(rec[0].message)
     assert "lineages" not in str(rec[0].message)
@@ -120,7 +126,7 @@ def test_the_cluster_basis_never_leaves_a_cluster_empty(toy_graph):
     a = toy_graph.copy()
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        gr = dt.tl.endpoints(a, a, ["source"], ["mid", "sink"], cluster_key="clusters",
+        gr = dt.tl.endpoints(a, ["source"], ["mid", "sink"], cluster_key="clusters",
                              graph="intr", p_end=0.005, seed=42, verbose=0,
                              p_basis="cluster")
     assert set(gr["sink_cluster_map"].values()) == {"mid", "sink"}

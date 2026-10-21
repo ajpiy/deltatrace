@@ -1,4 +1,4 @@
-"""pp.graphs and tl.trajectory — the one-call layer.
+"""pp.integrate and tl.trajectory — the one-call layer.
 
 These pin the wrapper CONTRACT (both graphs land in one object; the composition
 writes every downstream key), not the numerics of the stages, which are covered
@@ -19,9 +19,9 @@ def toy():
     return line_toy(n=120)
 
 
-def test_graphs_builds_both_into_one_object(toy):
+def test_integrate_builds_both_into_one_object(toy):
     expr, dist = toy
-    out = dt.pp.graphs(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
+    out = dt.pp.integrate(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
 
     for graph in ("expr", "intr"):
         assert f"neighbors_{graph}_distances" in out.obsp
@@ -33,15 +33,15 @@ def test_graphs_builds_both_into_one_object(toy):
     assert "disconnected_intr" in out.obs
 
 
-def test_graphs_rejects_unknown_mode(toy):
+def test_integrate_rejects_unknown_mode(toy):
     expr, dist = toy
     with pytest.raises(ValueError, match="unknown mode"):
-        dt.pp.graphs(expr, dist, modes=("expression", "nope"), verbose=False)
+        dt.pp.integrate(expr, dist, modes=("expression", "nope"), verbose=False)
 
 
 def test_trajectory_composes_the_pipeline(toy):
     expr, dist = toy
-    out = dt.pp.graphs(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
+    out = dt.pp.integrate(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
 
     res = dt.tl.trajectory(
         out, ["source"], ["sink"], cluster_key="clusters", graph="intr",
@@ -69,7 +69,7 @@ def test_trajectory_source_only_ranks_the_fates_and_leaves_the_choice(toy, capsy
     """Source-only without a cut runs the diffuse solve, prints the terminality ranking and
     returns it, and assigns no lineages: the caller picks the fates."""
     expr, dist = toy
-    out = dt.pp.graphs(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
+    out = dt.pp.integrate(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
     with pytest.warns(UserWarning, match=r"no lineages assigned.*sink_clusters") as rec:
         res = dt.tl.trajectory(out, ["source"], None, cluster_key="clusters", graph="intr",
                                basis="spatial", p_end=0.2, verbose=1)
@@ -83,7 +83,7 @@ def test_trajectory_source_only_ranks_the_fates_and_leaves_the_choice(toy, capsy
 
 def test_trajectory_source_only_with_a_cut_assigns_lineages(toy):
     expr, dist = toy
-    out = dt.pp.graphs(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
+    out = dt.pp.integrate(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
     res = dt.tl.trajectory(out, ["source"], None, cluster_key="clusters", graph="intr",
                            basis="spatial", p_end=0.2, n_lineages=1, verbose=False)
     assert set(res) == {"endpoints", "lineages"}
@@ -100,15 +100,15 @@ def test_trajectory_runs_on_a_lone_custom_graph(toy):
     assert "endpoint_mine" in g.obs
 
 
-def test_trajectory_without_any_graph_points_to_pp_graphs(toy):
+def test_trajectory_without_any_graph_points_to_pp_integrate(toy):
     expr, _ = toy
-    with pytest.raises(ValueError, match=r"dt\.pp\.graphs\(adata\)"):
+    with pytest.raises(ValueError, match=r"dt\.pp\.integrate\(adata\)"):
         dt.tl.trajectory(expr.copy(), ["source"], ["sink"], basis="spatial", verbose=0)
 
 
 def test_trajectory_with_two_graphs_but_no_intr_asks_which(toy):
     expr, dist = toy
-    g = dt.pp.graphs(expr, dist, modes=("expression",), verbose=0)
+    g = dt.pp.integrate(expr, dist, modes=("expression",), verbose=0)
     extra = dt.pp.integrate(expr, dist, mode="expression", key_added="mine", verbose=0)
     for k in ("distances", "connectivities"):
         g.obsp[f"neighbors_mine_{k}"] = extra.obsp[f"neighbors_mine_{k}"]
@@ -122,7 +122,7 @@ def test_trajectory_with_two_graphs_but_no_intr_asks_which(toy):
 # --------------------------------------------------------------------------------------
 def test_source_only_ranks_its_own_run_and_is_quiet_at_verbose_0(toy, capsys):
     expr, dist = toy
-    out = dt.pp.graphs(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
+    out = dt.pp.integrate(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
     dt.tl.trajectory(out, ["source"], ["sink"], cluster_key="clusters", graph="intr",
                      basis="spatial", p_end=0.2, verbose=0)
     flat = dt.tl.terminality(out, cluster_key="clusters", source_clusters=["source"],
@@ -146,7 +146,7 @@ def test_source_only_ranks_its_own_run_and_is_quiet_at_verbose_0(toy, capsys):
 @pytest.fixture
 def graphed(toy):
     expr, dist = toy
-    return dt.pp.graphs(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
+    return dt.pp.integrate(expr, dist, alpha=0.9, p_keep=0.3, verbose=False)
 
 
 def test_integer_labels_and_a_bare_string_label_are_accepted(graphed):
@@ -177,7 +177,7 @@ def test_an_unstored_graph_lists_the_stored_ones(graphed):
     with pytest.raises(ValueError, match=r"No graph 'intersection'.*\['expr', 'intr'\]"):
         dt.tl.trajectory(graphed.copy(), ["source"], ["sink"], graph="intersection",
                          basis="spatial", verbose=0)
-    only_expr = dt.pp.graphs(*line_toy(n=60), modes=("expression",), verbose=0)
+    only_expr = dt.pp.integrate(*line_toy(n=60), modes=("expression",), verbose=0)
     with pytest.raises(ValueError, match="'intr' is built by"):
         dt.tl.trajectory(only_expr, ["source"], ["sink"], graph="intr", basis="spatial",
                          verbose=0)
@@ -188,11 +188,11 @@ def test_a_custom_neighbors_key_is_used_and_never_silently_replaced(toy):
     expr, dist = toy
     a = expr.copy()
     sc.pp.neighbors(a, n_neighbors=7, use_rep="X_pca", key_added="k7")
-    g = dt.pp.graphs(a, dist, neighbors_key="k7", verbose=0)
+    g = dt.pp.integrate(a, dist, neighbors_key="k7", verbose=0)
     assert g.uns["neighbors_intr"]["params"]["n_neighbors"] == 7
     k7 = dt.pp.integrate(a, dist, alpha=0.0, mode="expression", neighbors_key="k7", verbose=0)
     knn = a.obsp["k7_connectivities"]
     np.testing.assert_allclose(k7.obsp["neighbors_expr_connectivities"].toarray(),
                                (knn / knn.max()).toarray())
     with pytest.raises(ValueError, match="neighbors_key='missing'"):
-        dt.pp.graphs(a, dist, neighbors_key="missing", verbose=0)
+        dt.pp.integrate(a, dist, neighbors_key="missing", verbose=0)

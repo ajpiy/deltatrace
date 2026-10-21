@@ -34,7 +34,7 @@ def line_toy(
     genes, and laid out left-to-right in the tissue along ``t``. Cluster labels split the
     continuum in thirds: ``"source"``, ``"mid"``, ``"sink"``. The returned expression object
     already carries a PCA and a kNN graph, so it can go straight into
-    :func:`deltatrace.pp.graphs`.
+    :func:`deltatrace.pp.integrate`.
 
     Parameters
     ----------
@@ -65,7 +65,7 @@ def line_toy(
         and an expression kNN graph under the default ``"neighbors"`` key.
     adata_dist : anndata.AnnData
         Dense ``(n, n)`` pairwise spatial distance matrix, in the shape
-        :func:`deltatrace.pp.graphs` expects for its ``adata_dist`` argument, with both
+        :func:`deltatrace.pp.integrate` expects for its ``adata_dist`` argument, with both
         axes labeled by ``adata.obs_names``.
     """
     import scanpy as sc
